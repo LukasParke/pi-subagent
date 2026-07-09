@@ -269,9 +269,11 @@ export default function registerSubagent(pi: ExtensionAPI): void {
         };
       }
 
-      const model = (pi as any).getModel?.() as { id?: string; provider?: string } | undefined;
+      const model = (ctx as { model?: { id?: string; provider?: string } }).model;
       const modelId =
-        model?.provider && model?.id ? `${model.provider}/${model.id}` : model?.id;
+        model?.provider && model?.id
+          ? `${model.provider}/${model.id}`
+          : model?.id;
 
       const availableTools =
         pi.getAllTools?.().map((t: { name: string }) => t.name) ||
