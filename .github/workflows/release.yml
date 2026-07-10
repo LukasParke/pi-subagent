@@ -1,5 +1,5 @@
 # Publish a Pi package release for:
-#   pi install npm:pi-subagent@X.Y.Z
+#   pi install npm:@lukehagar/pi-subagent@X.Y.Z
 #   pi install git:github.com/LukasParke/pi-subagent@vX.Y.Z
 #
 # Auth: npm Trusted Publishing (OIDC). Configure on npmjs.com:
@@ -141,8 +141,8 @@ jobs:
           ### Install with Pi
 
           \`\`\`bash
-          # npm (surfaces on pi.dev gallery via the pi-package keyword)
-          pi install npm:pi-subagent@${VERSION}
+          # npm (scoped — unscoped pi-subagent is blocked by npm name similarity)
+          pi install npm:@lukehagar/pi-subagent@${VERSION}
 
           # git pin (this release tag)
           pi install git:github.com/LukasParke/pi-subagent@${TAG}

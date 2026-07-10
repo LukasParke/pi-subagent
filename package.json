@@ -1,6 +1,6 @@
 {
-  "name": "pi-subagent",
-  "version": "0.1.0",
+  "name": "@lukehagar/pi-subagent",
+  "version": "0.1.1",
   "description": "Production-grade isolated subagents for the Pi coding agent",
   "type": "module",
   "license": "MIT",
@@ -20,9 +20,16 @@
     "subagent",
     "agents",
     "coding-agent",
-    "extension"
+    "extension",
+    "lukehagar"
   ],
-  "files": ["extensions", "src", "docs", "README.md", "LICENSE"],
+  "files": [
+    "extensions",
+    "src",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
   "publishConfig": {
     "access": "public",
     "provenance": true
@@ -36,7 +43,9 @@
     "release:check": "npm run check && npm run pack:check"
   },
   "pi": {
-    "extensions": ["./extensions/subagent.ts"]
+    "extensions": [
+      "./extensions/subagent.ts"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
@@ -53,5 +62,7 @@
     "typescript": "^5.9.3",
     "vitest": "^4.1.9"
   },
-  "engines": { "node": ">=20" }
+  "engines": {
+    "node": ">=20"
+  }
 }

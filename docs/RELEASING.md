@@ -4,8 +4,8 @@ Pi installs packages from **npm** or **git**. Publishing binds both:
 
 | Source | Install command | Needs |
 |--------|-----------------|-------|
-| npm | `pi install npm:pi-subagent@0.1.0` | npm publish + `pi-package` keyword |
-| git | `pi install git:github.com/LukasParke/pi-subagent@v0.1.0` | GitHub Release / tag |
+| npm | `pi install npm:@lukehagar/pi-subagent@0.1.1` | npm publish + `pi-package` keyword |
+| git | `pi install git:github.com/LukasParke/pi-subagent@v0.1.1` | GitHub Release / tag |
 | local | `pi install /path/to/pi-subagent` | checkout only |
 
 The [pi.dev package gallery](https://pi.dev/packages) lists npm packages that declare the `pi-package` keyword (already set in `package.json`).
@@ -18,14 +18,13 @@ No long-lived `NPM_TOKEN` is required or used.
 
 ### 1. Ensure the package exists on npm
 
-Trusted Publisher settings live under the **package** page. If `pi-subagent`
-does not exist yet:
+Trusted Publisher settings live under the **package** page.
 
-- Claim / create the package name under your npm account (first manual publish
-  with 2FA is fine), **or**
-- If npm offers pre-registration for the name on your account, create it there.
+**Name note:** unscoped `pi-subagent` is blocked by npm as too similar to the
+existing package [`pi-sub-agent`](https://www.npmjs.com/package/pi-sub-agent).
+This project publishes as **`@lukehagar/pi-subagent`** instead.
 
-Confirm: https://www.npmjs.com/package/pi-subagent (404 until first release).
+Confirm after first publish: https://www.npmjs.com/package/@lukehagar/pi-subagent
 
 ### 2. Add the trusted publisher
 
@@ -94,13 +93,13 @@ gh run watch
 
 ```bash
 # npm (gallery / versioned)
-pi install npm:pi-subagent@0.1.0
+pi install npm:@lukehagar/pi-subagent@0.1.1
 
 # latest npm
-pi install npm:pi-subagent
+pi install npm:@lukehagar/pi-subagent
 
 # git pin to the release tag
-pi install git:github.com/LukasParke/pi-subagent@v0.1.0
+pi install git:github.com/LukasParke/pi-subagent@v0.1.1
 
 # live main (not a release pin)
 pi install git:github.com/LukasParke/pi-subagent

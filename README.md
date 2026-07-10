@@ -11,14 +11,15 @@ capability profiles, a root/subagent/combined cost ledger, and a TUI inspector.
 Pi packages install from **npm**, **git**, or a **local path**:
 
 ```bash
-# npm (versioned; surfaces on the pi.dev gallery via the pi-package keyword)
-pi install npm:pi-subagent@0.1.0
+# npm (scoped; surfaces on the pi.dev gallery via the pi-package keyword)
+# Note: unscoped "pi-subagent" is rejected by npm as too similar to "pi-sub-agent".
+pi install npm:@lukehagar/pi-subagent@0.1.1
 
 # latest npm
-pi install npm:pi-subagent
+pi install npm:@lukehagar/pi-subagent
 
 # git pin to a release tag
-pi install git:github.com/LukasParke/pi-subagent@v0.1.0
+pi install git:github.com/LukasParke/pi-subagent@v0.1.1
 
 # live main
 pi install git:github.com/LukasParke/pi-subagent
