@@ -179,35 +179,51 @@ export function validateSubagentRequest(
   const maxDepth = options.maxDepth ?? defaultConfig.maxDepth;
   if (depth >= maxDepth) return { ok: false, error: `Subagent nesting depth limit reached (${depth} >= ${maxDepth})` };
 
-  if ("action" in params) {
+  const hasAction = params.action !== undefined;
+  const hasTask = typeof params.task === "string";
+  const hasTasks = Array.isArray(params.tasks);
+  const modes = [hasAction, hasTask, hasTasks].filter(Boolean).length;
+  if (modes === 0) {
+    return { ok: false, error: "Provide task, tasks, or action (status|wait|cancel)" };
+  }
+  if (modes > 1) {
+    return { ok: false, error: "Provide exactly one of: action, task, or tasks" };
+  }
+
+  if (hasAction) {
     if ((params.action === "wait" || params.action === "cancel") && !params.id) {
       return { ok: false, error: `${params.action} requires a run id` };
     }
-    return { ok: true, mode: params.action, async: false, id: params.id, tasks: [] };
+    // Management actions ignore task-config fields; reject obvious conflict residues.
+    if (params.async !== undefined) {
+      return { ok: false, error: "async cannot be combined with action" };
+    }
+    return { ok: true, mode: params.action!, async: false, id: params.id, tasks: [] };
   }
 
-  const rawTasks = "tasks" in params ? params.tasks : [params];
-  const maxTasks = options.maxTasks ?? defaultConfig.maxTasksPerRun;
-  if (!rawTasks.length || rawTasks.length > maxTasks) return { ok: false, error: `Expected 1..${maxTasks} tasks` };
-  const tasks: ResolvedTask[] = [];
-  for (let index = 0; index < rawTasks.length; index++) {
-    const normalized = normalizeTask(
-      rawTasks[index] as ParallelTaskInput,
-      index,
-      parent,
-      "tasks" in params ? "explore" : "general",
-    );
-    if (normalized.error || !normalized.task) return { ok: false, error: normalized.error ?? "Invalid task" };
-    tasks.push(normalized.task);
+  if (hasTasks) {
+    const rawTasks = params.tasks!;
+    const maxTasks = options.maxTasks ?? defaultConfig.maxTasksPerRun;
+    if (!rawTasks.length || rawTasks.length > maxTasks) return { ok: false, error: `Expected 1..${maxTasks} tasks` };
+    // Top-level TaskFields apply only to single-task mode.
+    if (params.system_prompt !== undefined || params.model !== undefined || params.tools !== undefined || params.profile !== undefined || params.cwd !== undefined || params.resume !== undefined) {
+      return { ok: false, error: "Top-level task options cannot be combined with tasks[]; set them on each tasks[] item" };
+    }
+    const tasks: ResolvedTask[] = [];
+    for (let index = 0; index < rawTasks.length; index++) {
+      const normalized = normalizeTask(rawTasks[index] as ParallelTaskInput, index, parent, "explore");
+      if (normalized.error || !normalized.task) return { ok: false, error: normalized.error ?? "Invalid task" };
+      tasks.push(normalized.task);
+    }
+    const parallelError = validateParallel(tasks);
+    if (parallelError) return { ok: false, error: parallelError };
+    return { ok: true, mode: tasks.length > 1 ? "parallel" : "single", async: params.async === true, tasks };
   }
-  const parallelError = validateParallel(tasks);
-  if (parallelError) return { ok: false, error: parallelError };
-  return {
-    ok: true,
-    mode: tasks.length > 1 ? "parallel" : "single",
-    async: params.async === true,
-    tasks,
-  };
+
+  // Single-task mode: top-level fields form the one task.
+  const normalized = normalizeTask(params as ParallelTaskInput, 0, parent, "general");
+  if (normalized.error || !normalized.task) return { ok: false, error: normalized.error ?? "Invalid task" };
+  return { ok: true, mode: "single", async: params.async === true, tasks: [normalized.task] };
 }
 
 export function describeCapability(task: ResolvedTask): string {

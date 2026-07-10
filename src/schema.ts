@@ -12,6 +12,11 @@ const ThinkingLevel = Type.Union([
 const OutputMode = Type.Union([Type.Literal("inline"), Type.Literal("file-only")]);
 const Profile = Type.Union([Type.Literal("explore"), Type.Literal("review"), Type.Literal("general")]);
 const Isolation = Type.Union([Type.Literal("shared"), Type.Literal("worktree")]);
+const Action = Type.Union([
+  Type.Literal("status"),
+  Type.Literal("wait"),
+  Type.Literal("cancel"),
+]);
 
 /** Shared optional task configuration fields. */
 export const TaskFields = {
@@ -43,54 +48,51 @@ export const ParallelTaskItem = Type.Object(
 );
 
 /**
- * Discriminated by `action` when present; otherwise single or parallel task request.
- * Management actions cannot carry task payloads.
+ * Provider-facing tool parameters.
+ *
+ * IMPORTANT: LLM tool APIs (OpenAI-compatible / OpenRouter / Anthropic via many
+ * providers) require the top-level parameters schema to be JSON Schema
+ * `type: "object"`. A Type.Union serializes as `anyOf` without `type: "object"`,
+ * which surfaces as:
+ *   Invalid schema for function 'subagent': schema must be a JSON Schema of
+ *   'type: "object"', got 'type: "None"'.
+ *
+ * Mode exclusivity (action vs task vs tasks) is enforced in policy validation,
+ * not at the JSON Schema layer.
  */
-export const SubagentParamsSchema = Type.Union(
-  [
-    Type.Object(
-      {
-        action: Type.Literal("status"),
-        id: Type.Optional(Type.String({ minLength: 1 })),
-      },
-      { additionalProperties: false },
+export const SubagentParamsSchema = Type.Object(
+  {
+    // Management actions
+    action: Type.Optional(Action),
+    id: Type.Optional(Type.String({ minLength: 1, description: "Run id for status/wait/cancel." })),
+
+    // Single-task mode
+    task: Type.Optional(Type.String({ minLength: 1, description: "Task to delegate (single mode)." })),
+    ...TaskFields,
+    async: Type.Optional(Type.Boolean({ description: "Run in the background and return a handle immediately." })),
+
+    // Parallel mode
+    tasks: Type.Optional(
+      Type.Array(ParallelTaskItem, {
+        minItems: 1,
+        maxItems: 8,
+        description: "Array of independent tasks for parallel mode.",
+      }),
     ),
-    Type.Object(
-      {
-        action: Type.Literal("wait"),
-        id: Type.Optional(Type.String({ minLength: 1 })),
-      },
-      { additionalProperties: false },
-    ),
-    Type.Object(
-      {
-        action: Type.Literal("cancel"),
-        id: Type.Optional(Type.String({ minLength: 1 })),
-      },
-      { additionalProperties: false },
-    ),
-    Type.Object(
-      {
-        task: Type.String({ minLength: 1, description: "Task to delegate (single mode)." }),
-        ...TaskFields,
-        async: Type.Optional(Type.Boolean()),
-      },
-      { additionalProperties: false },
-    ),
-    Type.Object(
-      {
-        tasks: Type.Array(ParallelTaskItem, {
-          minItems: 1,
-          maxItems: 8,
-          description: "Array of independent tasks for parallel mode.",
-        }),
-        async: Type.Optional(Type.Boolean()),
-      },
-      { additionalProperties: false },
-    ),
-  ],
-  { description: "Subagent request: single, parallel, status, wait, or cancel." },
+  },
+  {
+    additionalProperties: false,
+    description: "Subagent request: single, parallel, status, wait, or cancel.",
+  },
 );
 
 export type SubagentParams = Static<typeof SubagentParamsSchema>;
 export type ParallelTaskInput = Static<typeof ParallelTaskItem>;
+
+/** Runtime guard used by tests/docs to assert provider compatibility. */
+export function assertObjectToolSchema(schema: unknown): asserts schema is { type: "object" } {
+  if (!schema || typeof schema !== "object" || (schema as { type?: unknown }).type !== "object") {
+    const type = schema && typeof schema === "object" ? (schema as { type?: unknown }).type : typeof schema;
+    throw new Error(`Tool parameters must be JSON Schema type "object", got ${JSON.stringify(type ?? "None")}`);
+  }
+}
