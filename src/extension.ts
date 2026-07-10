@@ -1,34 +1,41 @@
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import { Buffer } from "node:buffer";
+import type { ExtensionAPI, ExtensionContext, Theme, ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
 import { keyHint } from "@earendil-works/pi-coding-agent";
-import type { Component, TUI } from "@earendil-works/pi-tui";
+import { Container, Text, type Component, type TUI } from "@earendil-works/pi-tui";
 import { Value } from "typebox/value";
 import { defaultConfig, type SubagentConfig } from "./config.js";
-import { SubagentParamsSchema, type SubagentParams } from "./schema.js";
-import { validateSubagentRequest, parseDepth, type ResolvedTask } from "./policy.js";
-import { SessionScopedRunRegistry, type LiveRun } from "./registry.js";
-import { OutputManager } from "./output.js";
+import { formatStatusPreview, renderCall as renderCallLines, renderResult as renderResultLines } from "./format.js";
 import { runTasks } from "./orchestrator.js";
+import { OutputManager } from "./output.js";
+import { parseDepth, validateSubagentRequest, type ResolvedTask } from "./policy.js";
+import { SessionScopedRunRegistry, type LiveRun } from "./registry.js";
+import { SubagentParamsSchema, type SubagentParams } from "./schema.js";
 import { Semaphore } from "./semaphore.js";
-import { WorktreeManager } from "./worktree.js";
-import {
-  createSubagentsOverlay,
-  FooterStatusModel,
-  type SubagentAdapter,
-} from "./ui.js";
-import { renderCall, renderResult, formatStatusPreview } from "./format.js";
 import type { RunSnapshot, TaskResult, TaskSpec } from "./types.js";
+import { emptyUsage } from "./types.js";
+import { buildUsageLedger, formatLedger } from "./usage.js";
+import { createSubagentsOverlay, FooterStatusModel, type SubagentAdapter } from "./ui.js";
+import { WorktreeManager } from "./worktree.js";
 
-const RUN_ENTRY = "subagent-run-v1";
-
-function sessionKeyFrom(ctx: ExtensionContext): string {
-  return (
-    ctx.sessionManager.getSessionFile() ||
-    ctx.sessionManager.getSessionId?.() ||
-    "ephemeral"
-  );
+interface SessionRuntime {
+  key: string;
+  ctx: ExtensionContext;
+  config: SubagentConfig;
+  registry: SessionScopedRunRegistry;
+  output: OutputManager;
+  semaphore: Semaphore;
+  worktrees: WorktreeManager;
+  footer?: FooterStatusModel;
+  unsubscribe?: () => void;
+  pendingRootMessages: import("@earendil-works/pi-ai").Message[];
+  closed: boolean;
 }
 
-function liveToSnapshot(run: LiveRun): RunSnapshot {
+function sessionKey(ctx: ExtensionContext): string {
+  return ctx.sessionManager.getSessionFile() || ctx.sessionManager.getSessionId() || `ephemeral:${ctx.cwd}`;
+}
+
+function toSnapshot(run: LiveRun): RunSnapshot {
   return {
     schemaVersion: 1,
     id: run.id,
@@ -40,192 +47,253 @@ function liveToSnapshot(run: LiveRun): RunSnapshot {
     taskPreviews: run.taskPreviews,
     summary: run.summary,
     delivered: run.delivered,
-    results: run.results.map((r) => ({
-      label: r.label,
-      task: r.task,
-      state: r.state,
-      exitCode: r.exitCode,
-      stopReason: r.stopReason,
-      errorMessage: r.errorMessage,
-      usage: r.usage,
-      model: r.model,
-      outputFile: r.outputFile,
-      sessionId: r.sessionId,
-      finalOutput: r.liveText,
+    results: run.results.map((result) => ({
+      label: result.label,
+      task: result.task,
+      state: result.state,
+      exitCode: result.exitCode,
+      stopReason: result.stopReason,
+      errorMessage: result.errorMessage,
+      usage: result.usage,
+      model: result.model,
+      thinking: result.thinking,
+      profile: result.profile,
+      canWrite: result.canWrite,
+      outputFile: result.outputFile,
+      outputMode: result.outputMode,
+      worktree: result.worktree,
+      sessionId: result.sessionId,
+      finalOutput: result.liveText,
+      transcript: result.messages
+        .flatMap((message: any) => message.role === "assistant" && Array.isArray(message.content)
+          ? message.content.map((part: any) => part.type === "text" ? part.text : part.type === "toolCall" ? `→ ${part.name} ${JSON.stringify(part.arguments ?? {})}` : "")
+          : message.role === "toolResult" ? [`← ${message.toolName}`] : [])
+        .filter(Boolean)
+        .join("\n") || undefined,
     })),
   };
 }
 
-function buildAdapter(
-  registry: SessionScopedRunRegistry,
-  key: string,
-  ctx: ExtensionContext,
-): SubagentAdapter {
+function activeEntries(runtime: SessionRuntime): readonly unknown[] {
+  return runtime.ctx.sessionManager.getBranch();
+}
+
+function ledger(runtime: SessionRuntime) {
+  const entries = activeEntries(runtime);
+  return buildUsageLedger(
+    entries,
+    [
+      ...runtime.registry.getLiveRuns(runtime.key).map(toSnapshot),
+      ...runtime.registry.getSnapshots(runtime.key),
+    ],
+    runtime.pendingRootMessages,
+  );
+}
+
+function makeAdapter(runtime: SessionRuntime): SubagentAdapter {
   return {
-    getActiveRuns() {
-      return registry.getLiveRuns(key).map(liveToSnapshot);
-    },
-    getCompletedRuns() {
-      const rt = registry.getSessionRuntime(key);
-      return rt ? Array.from(rt.snapshots.values()) : [];
-    },
-    getRunById(id: string) {
-      const found = registry.lookup(id, key);
+    getActiveRuns: () => runtime.registry.getLiveRuns(runtime.key).map(toSnapshot),
+    getCompletedRuns: () => runtime.registry.getSnapshots(runtime.key),
+    getRunById(id) {
+      const found = runtime.registry.lookup(id, runtime.key);
       if (found.status !== "found" || !found.run) return null;
-      const run = found.run as LiveRun | RunSnapshot;
-      if ("controller" in run) return liveToSnapshot(run as LiveRun);
-      return run as RunSnapshot;
+      return "controller" in found.run ? toSnapshot(found.run) : found.run;
     },
-    cancelRun(id: string) {
-      const found = registry.lookup(id, key);
-      if (found.status === "found" && found.run && "controller" in found.run) {
-        (found.run as LiveRun).controller.abort();
+    cancelRun(id) {
+      const found = runtime.registry.lookup(id, runtime.key);
+      if (found.status === "found" && found.run && "controller" in found.run) found.run.controller.abort();
+    },
+    dismissRun: (id) => { runtime.registry.markDismissed(id, runtime.key); },
+    async resumeRun(id) {
+      const run = this.getRunById(id);
+      const session = run?.results.find((result) => result.sessionId)?.sessionId;
+      if (!session) {
+        runtime.ctx.ui.notify("No resumable child session is available", "warning");
+        return;
+      }
+      runtime.ctx.ui.setEditorText(`Continue the subagent session ${session}. Ask me for the follow-up task, then use the subagent tool with resume: "${session}".`);
+      runtime.ctx.ui.notify("Prepared a resume request in the editor", "info");
+    },
+    showOutput(id) {
+      const run = this.getRunById(id);
+      const pointers = run?.results.flatMap((result) => [result.outputFile, result.worktree?.cwd, result.sessionId]).filter(Boolean) as string[] | undefined;
+      if (!pointers?.length) runtime.ctx.ui.notify("No output artifact, worktree, or session pointer", "warning");
+      else {
+        runtime.ctx.ui.setEditorText(pointers.join("\n"));
+        runtime.ctx.ui.notify("Output pointers copied to the editor", "info");
       }
     },
-    dismissRun(id: string) {
-      registry.markDismissed(id, key);
-    },
-    async resumeRun() {
-      ctx.ui.notify("Use the subagent tool with resume=<sessionId> for follow-up", "info");
-    },
-    showOutput(id: string) {
-      const snap = this.getRunById(id);
-      const out = snap?.results.map((r) => r.outputFile || r.sessionId).filter(Boolean).join(", ");
-      ctx.ui.notify(out || "No output path / session id", "info");
-    },
-    getReadyCount() {
-      const rt = registry.getSessionRuntime(key);
-      if (!rt) return 0;
-      return Array.from(rt.snapshots.values()).filter((s) => !s.delivered && s.state !== "running")
-        .length;
-    },
+    getReadyCount: () => runtime.registry.getSnapshots(runtime.key).filter((run) => !run.delivered).length,
+    getUsageSummary: () => formatLedger(ledger(runtime)),
+    subscribe: (listener) => runtime.registry.subscribe((event) => {
+      if (event.sessionKey === runtime.key) listener();
+    }),
     notify(message, level = "info") {
-      ctx.ui.notify(message, level === "error" ? "error" : level === "warn" ? "warning" : "info");
+      runtime.ctx.ui.notify(message, level === "warn" ? "warning" : level);
     },
   };
 }
 
-function guidelines(): string {
+function refreshFooter(runtime: SessionRuntime): void {
+  if (runtime.closed || !runtime.footer) return;
+  const active = runtime.registry.getLiveRuns(runtime.key).length;
+  runtime.footer.update(active);
+  const text = runtime.footer.render(runtime.ctx.ui.theme, 160);
+  const totals = ledger(runtime).combined;
+  const hasUsage = totals.cost > 0 || totals.turns > 0;
+  runtime.ctx.ui.setStatus("subagent", active || runtime.registry.getSnapshots(runtime.key).some((run) => !run.delivered) || hasUsage ? text : undefined);
+}
+
+function utf8Preview(value: unknown, maxBytes: number): string {
+  const buffer = Buffer.from(String(value ?? ""), "utf8");
+  if (buffer.length <= maxBytes) return buffer.toString("utf8");
+  let end = Math.max(0, maxBytes);
+  while (end > 0 && (buffer[end] & 0xc0) === 0x80) end--;
+  return buffer.subarray(0, end).toString("utf8");
+}
+
+function compactDetails(mode: "single" | "parallel", results: Array<TaskResult | RunSnapshot["results"][number]>) {
+  const perResultText = Math.max(256, Math.floor(defaultConfig.maxDetailsTextBytes / Math.max(1, results.length) / 2));
+  return {
+    mode,
+    results: results.map((result: any) => ({
+      label: result.label,
+      task: String(result.task ?? "").slice(0, 500),
+      state: result.state,
+      exitCode: result.exitCode,
+      stopReason: result.stopReason,
+      errorMessage: result.errorMessage?.slice(0, 1_000),
+      usage: result.usage ?? emptyUsage(),
+      model: result.model,
+      thinking: result.thinking,
+      profile: result.profile,
+      canWrite: result.canWrite,
+      outputFile: result.outputFile,
+      outputMode: result.outputMode,
+      worktree: result.worktree,
+      sessionId: result.sessionId,
+      finalOutput: utf8Preview(result.finalOutput ?? result.liveText, perResultText),
+      transcript: utf8Preview(result.transcript, perResultText),
+    })),
+  };
+}
+
+function lineComponent(render: (width: number) => string[]): Component {
+  return { render, invalidate() {} };
+}
+
+function expandHint(): string {
+  try {
+    return keyHint("app.tools.expand", "expand");
+  } catch {
+    // Headless SDK/tests may not initialize Pi's global theme.
+    return "expand";
+  }
+}
+
+function fail(message: string): never {
+  throw new Error(message);
+}
+
+function guidelines(): string[] {
   return [
-    "Use the subagent tool to isolate exploratory research, parallel independent analysis, or clean-context review.",
-    "Prefer profile 'explore' (default for parallel) or 'review' for read-only work. Never treat bash as read-only.",
-    "Do not parallelize multiple writers on the same checkout unless each uses isolation:'worktree' or distinct cwd.",
-    "Each task must be fully self-contained: objective, scope, sources, required output format, success criteria, and effort/budget.",
-    "For large results use output + output_mode:'file-only' and return a pointer.",
-    "Keep tightly-coupled implementation work in the parent; use a reviewer subagent after changes when useful.",
-    "Manage background runs with action status/wait/cancel and the /subagents inspector.",
-  ].join(" ");
+    "Delegate independent, read-heavy exploration or clean-context review; keep tightly coupled work in the parent.",
+    "Parallel tasks default to the strict read-only explore profile. Use isolated worktrees for parallel writers.",
+    "Specify objective, context, scope, exclusions, output format, success criteria, and effort/budget.",
+    "Use output_mode:file-only for large results; status is compact and wait delivers once.",
+  ];
 }
 
 export default function registerSubagent(pi: ExtensionAPI): void {
-  let config: SubagentConfig = { ...defaultConfig };
-  let registry: SessionScopedRunRegistry | null = null;
-  let outputManager: OutputManager | null = null;
-  let semaphore: Semaphore | null = null;
-  let worktrees: WorktreeManager | null = null;
-  let footer: FooterStatusModel | null = null;
-  let currentKey = "ephemeral";
-  let uiCtx: ExtensionContext | null = null;
-  let statusTimer: NodeJS.Timeout | null = null;
+  let current: SessionRuntime | undefined;
 
-  const stopStatusTimer = () => {
-    if (statusTimer) {
-      clearInterval(statusTimer);
-      statusTimer = null;
-    }
-  };
-
-  const setFooterText = (text: string) => {
-    // Best-effort: some Pi builds expose setStatus / setFooter via ui.
-    const ui = uiCtx?.ui as any;
-    if (ui?.setStatus) ui.setStatus("subagent", text);
-    else if (ui?.setFooter) ui.setFooter(text);
-  };
-
-  const refreshStatus = () => {
-    if (!registry || !footer || !uiCtx) {
-      setFooterText("");
-      return;
-    }
-    const live = registry.getLiveRuns(currentKey);
-    const ready = footer["adapter"]
-      ? (footer as any).adapter.getReadyCount()
-      : 0;
-    footer.update(live.length, ready);
-    const themeStub = {
-      fg: (_name: string, s: string) => s,
-    } as Theme;
-    setFooterText(footer.render(themeStub, 80));
-    if (live.length === 0) stopStatusTimer();
-  };
-
-  const ensureTimer = () => {
-    if (statusTimer || !uiCtx) return;
-    statusTimer = setInterval(refreshStatus, 500);
-    statusTimer.unref?.();
-  };
-
-  const persistenceAdapter = {
-    appendEntry(type: string, payload: unknown) {
-      try {
-        pi.appendEntry(type, payload as any);
-      } catch {
-        // Session may be unavailable during teardown
-      }
-    },
-    getEntries() {
-      return (uiCtx?.sessionManager.getBranch?.() ||
-        uiCtx?.sessionManager.getEntries?.() ||
-        []) as any[];
-    },
-    getActiveBranch() {
-      // getBranch returns entry chain; treat presence as "active"
-      return "active";
-    },
-  };
+  async function teardown(runtime: SessionRuntime): Promise<void> {
+    if (runtime.closed) return;
+    await runtime.registry.shutdown(runtime.key, 8_000);
+    runtime.closed = true;
+    runtime.unsubscribe?.();
+    runtime.footer?.dispose();
+    runtime.ctx.ui.setStatus("subagent", undefined);
+  }
 
   pi.on("session_start", async (_event, ctx) => {
-    uiCtx = ctx;
-    currentKey = sessionKeyFrom(ctx);
-    config = { ...defaultConfig };
-    semaphore = new Semaphore(config.maxActiveProcesses, config.maxQueuedTasks);
-    worktrees = new WorktreeManager();
-    outputManager = new OutputManager(config);
-    registry = new SessionScopedRunRegistry(config, persistenceAdapter);
-
+    if (current && !current.closed) await teardown(current);
+    const runtime = {} as SessionRuntime;
+    runtime.key = sessionKey(ctx);
+    runtime.ctx = ctx;
+    runtime.config = { ...defaultConfig };
+    runtime.output = new OutputManager(runtime.config);
+    runtime.semaphore = new Semaphore(runtime.config.maxActiveProcesses, runtime.config.maxQueuedTasks);
+    runtime.worktrees = new WorktreeManager();
+    runtime.pendingRootMessages = [];
+    runtime.closed = false;
+    runtime.registry = new SessionScopedRunRegistry(runtime.config, {
+      getEntries: () => ctx.sessionManager.getBranch() as any[],
+      appendEntry: (type, data) => {
+        // Captured runtime ownership prevents an old async callback from appending to a new session.
+        if (current !== runtime || runtime.closed || sessionKey(ctx) !== runtime.key) return;
+        pi.appendEntry(type, data);
+      },
+    });
     if (ctx.hasUI) {
-      const adapter = buildAdapter(registry, currentKey, ctx);
-      footer = new FooterStatusModel(adapter);
-      footer.setOnUpdate(() => refreshStatus());
-      refreshStatus();
+      runtime.footer = new FooterStatusModel(makeAdapter(runtime));
+      runtime.footer.setOnUpdate(() => refreshFooter(runtime));
+      runtime.unsubscribe = runtime.registry.subscribe((event) => {
+        if (event.sessionKey !== runtime.key) return;
+        if (event.type === "terminal") {
+          runtime.footer?.notifyTerminal(
+            event.runId,
+            `Subagent ${event.runId.slice(0, 8)} ${event.state}`,
+            event.state === "completed" ? "info" : "warn",
+          );
+        }
+        refreshFooter(runtime);
+      });
     }
+    current = runtime;
+    refreshFooter(runtime);
+  });
+
+  pi.on("message_end", async (event) => {
+    const runtime = current;
+    if (!runtime || runtime.closed || event.message.role !== "assistant") return;
+    // Supplement immediately; ledger deduplicates when SessionManager exposes it.
+    runtime.pendingRootMessages.push(event.message);
+    if (runtime.pendingRootMessages.length > 20) runtime.pendingRootMessages.shift();
+    refreshFooter(runtime);
+  });
+
+  pi.on("session_before_tree", async () => {
+    const runtime = current;
+    if (!runtime || runtime.closed) return;
+    // Finish persistence on the originating leaf before Pi moves the branch pointer.
+    await runtime.registry.shutdown(runtime.key, 8_000);
+  });
+
+  pi.on("session_tree", async () => {
+    const runtime = current;
+    if (!runtime || runtime.closed) return;
+    runtime.pendingRootMessages = [];
+    runtime.registry.refreshSnapshots(runtime.key);
+    refreshFooter(runtime);
   });
 
   pi.on("session_shutdown", async () => {
-    stopStatusTimer();
-    if (registry) {
-      await registry.shutdown(currentKey, 8_000);
-      registry = null;
-    }
-    footer?.dispose();
-    footer = null;
-    uiCtx = null;
-    setFooterText("");
+    const runtime = current;
+    if (!runtime) return;
+    // Keep ownership valid until cancellation, process close, and final persistence finish.
+    await teardown(runtime);
+    if (current === runtime) current = undefined;
   });
 
   pi.registerCommand("subagents", {
-    description: "Inspect subagent runs (live + completed)",
+    description: "Inspect subagent runs, artifacts, sessions, and combined usage",
     handler: async (_args, ctx) => {
-      if (!registry) {
-        ctx.ui.notify("Subagent registry not ready", "error");
-        return;
-      }
-      const key = sessionKeyFrom(ctx);
-      const adapter = buildAdapter(registry, key, ctx);
+      const runtime = current;
+      if (!runtime || runtime.key !== sessionKey(ctx)) return ctx.ui.notify("Subagent runtime is not ready", "error");
       await ctx.ui.custom(
-        (tui: TUI, theme: Theme, _kb: unknown, done: (result?: unknown) => void) =>
-          createSubagentsOverlay(tui, theme, adapter, done) as Component,
-        { overlay: true, overlayOptions: { width: "80%", maxHeight: "80%" } } as any,
+        (tui: TUI, theme: Theme, _keybindings, done) => createSubagentsOverlay(tui, theme, makeAdapter(runtime), () => done(undefined)),
+        { overlay: true, overlayOptions: { width: "80%", maxHeight: "80%" } },
       );
     },
   });
@@ -233,352 +301,173 @@ export default function registerSubagent(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
-    description:
-      "Delegate an isolated Pi subagent task (single, parallel, or cancellable background). " +
-      guidelines(),
-    promptGuidelines: guidelines().split(/(?<=\.)\s+/),
-    parameters: SubagentParamsSchema as any,
-    async execute(
-      _toolCallId,
-      rawParams: SubagentParams,
-      signal: AbortSignal | undefined,
-      _onUpdate,
-      ctx: ExtensionContext,
-    ) {
-      if (!registry || !outputManager || !semaphore || !worktrees) {
-        return {
-          content: [{ type: "text", text: "Subagent extension is not initialized for this session." }],
-          details: { mode: "single", results: [] },
-          isError: true,
-        };
+    description: "Run isolated Pi subagents in foreground, parallel, or cancellable background mode.",
+    promptGuidelines: guidelines(),
+    parameters: SubagentParamsSchema,
+    async execute(_id, params: SubagentParams, signal, onUpdate, ctx) {
+      const runtime = current;
+      if (!runtime || runtime.closed || runtime.key !== sessionKey(ctx)) {
+        fail("Subagent runtime is not initialized for this session.");
+      }
+      if (!Value.Check(SubagentParamsSchema, params)) {
+        const errors = [...Value.Errors(SubagentParamsSchema, params)].slice(0, 5).map((error: any) => error.message).join("; ");
+        fail(`Invalid parameters: ${errors}`);
       }
 
-      // Runtime validation layer on top of TypeBox schema
-      if (!Value.Check(SubagentParamsSchema, rawParams as any)) {
-        const errors = [...Value.Errors(SubagentParamsSchema, rawParams as any)]
-          .slice(0, 5)
-          .map((e) => {
-            const anyErr = e as { path?: string; instancePath?: string; message?: string };
-            return `${anyErr.path ?? anyErr.instancePath ?? "?"}: ${anyErr.message ?? "invalid"}`;
-          })
-          .join("; ");
-        return {
-          content: [{ type: "text", text: `Invalid subagent parameters: ${errors}` }],
-          details: { mode: "single", results: [] },
-          isError: true,
-        };
-      }
-
-      const model = (ctx as { model?: { id?: string; provider?: string } }).model;
-      const modelId =
-        model?.provider && model?.id
-          ? `${model.provider}/${model.id}`
-          : model?.id;
-
-      const availableTools =
-        pi.getAllTools?.().map((t: { name: string }) => t.name) ||
-        pi.getActiveTools?.() ||
-        ["read", "bash", "edit", "write", "grep", "find", "ls"];
-
-      const validation = validateSubagentRequest(rawParams, {
+      const model = ctx.model;
+      const validated = validateSubagentRequest(params, {
         cwd: ctx.cwd,
-        model: modelId,
-        thinking: pi.getThinkingLevel?.() as TaskSpec["thinking"],
-        availableTools,
-        activeTools: pi.getActiveTools?.(),
+        model: model ? `${model.provider}/${model.id}` : undefined,
+        thinking: pi.getThinkingLevel() as TaskSpec["thinking"],
+        availableTools: pi.getAllTools().map((tool) => tool.name),
+        activeTools: pi.getActiveTools(),
         depth: parseDepth(),
       });
+      if (!validated.ok) fail(validated.error);
 
-      if (!validation.ok) {
-        return {
-          content: [{ type: "text", text: validation.error }],
-          details: { mode: "single", results: [] },
-          isError: true,
-        };
+      if (["status", "wait", "cancel"].includes(validated.mode)) {
+        if (validated.mode === "status" && !validated.id) {
+          const runs = [
+            ...runtime.registry.getLiveRuns(runtime.key).map(toSnapshot),
+            ...runtime.registry.getSnapshots(runtime.key),
+          ];
+          const text = [runs.length ? runs.map((run) => formatStatusPreview(run)).join("\n") : "No subagent runs.", formatLedger(ledger(runtime))].join("\n\n");
+          return { content: [{ type: "text", text }], details: compactDetails("single", []) };
+        }
+        const found = runtime.registry.lookup(validated.id!, runtime.key);
+        if (found.status === "ambiguous") fail(`Ambiguous id. Matches: ${found.matches!.join(", ")}`);
+        if (found.status !== "found" || !found.run) fail(`Run ${validated.id} was not found in this session.`);
+        const snapshot = "controller" in found.run ? toSnapshot(found.run) : found.run;
+        if (validated.mode === "status") {
+          return { content: [{ type: "text", text: `${formatStatusPreview(snapshot)}\n${formatLedger(ledger(runtime))}` }], details: compactDetails(snapshot.mode, snapshot.results) };
+        }
+        if (validated.mode === "cancel") {
+          if ("controller" in found.run) found.run.controller.abort();
+          return { content: [{ type: "text", text: `Cancellation requested for ${snapshot.id}` }], details: compactDetails(snapshot.mode, snapshot.results) };
+        }
+        if ("promise" in found.run) await found.run.promise.catch(() => {});
+        const refreshed = runtime.registry.lookup(snapshot.id, runtime.key);
+        const terminal = refreshed.status === "found" && refreshed.run
+          ? "controller" in refreshed.run ? toSnapshot(refreshed.run) : refreshed.run
+          : snapshot;
+        if (!runtime.registry.markDelivered(terminal.id, runtime.key)) {
+          return { content: [{ type: "text", text: `Run ${terminal.id} was already delivered. Artifacts and sessions remain available in /subagents.` }], details: compactDetails(terminal.mode, terminal.results) };
+        }
+        const delivered = runtime.output.capOutputForDelivery(terminal.results);
+        const text = delivered.text || terminal.summary || "(no output)";
+        if (terminal.state === "failed" || terminal.state === "lost") fail(text);
+        return { content: [{ type: "text", text }], details: compactDetails(terminal.mode, delivered.cappedResults as any) };
       }
 
-      const key = sessionKeyFrom(ctx);
-
-      // Management actions
-      if (validation.mode === "status" || validation.mode === "wait" || validation.mode === "cancel") {
-        const lookup = registry.lookup(validation.id ?? "", key);
-        if (lookup.status === "ambiguous") {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Ambiguous run id prefix. Matches: ${(lookup.matches || []).join(", ")}`,
-              },
-            ],
-            details: { mode: "single", results: [] },
-            isError: true,
-          };
-        }
-        if (lookup.status === "not-found" || !lookup.run) {
-          const live = registry.getLiveRuns(key);
-          const ids = live.map((r) => r.id).join(", ") || "(none running)";
-          return {
-            content: [
-              {
-                type: "text",
-                text: validation.id
-                  ? `No run found for id "${validation.id}". Live: ${ids}`
-                  : `No id provided. Live runs: ${ids}`,
-              },
-            ],
-            details: { mode: "single", results: [] },
-            isError: true,
-          };
-        }
-
-        const run = lookup.run as LiveRun | RunSnapshot;
-        const snap: RunSnapshot =
-          "controller" in run ? liveToSnapshot(run as LiveRun) : (run as RunSnapshot);
-
-        if (validation.mode === "status") {
-          const preview = formatStatusPreview(snap);
-          return {
-            content: [{ type: "text", text: preview }],
-            details: { mode: snap.mode, results: [] },
-          };
-        }
-
-        if (validation.mode === "cancel") {
-          if ("controller" in run) (run as LiveRun).controller.abort();
-          return {
-            content: [{ type: "text", text: `Cancelled run ${snap.id}` }],
-            details: { mode: snap.mode, results: [] },
-          };
-        }
-
-        // wait
-        if ("promise" in run && "controller" in run) {
-          await (run as LiveRun).promise.catch(() => {});
-        }
-        // refresh after completion
-        const after = registry.lookup(snap.id, key);
-        const finalSnap =
-          after.status === "found" && after.run
-            ? "controller" in after.run
-              ? liveToSnapshot(after.run as LiveRun)
-              : (after.run as RunSnapshot)
-            : snap;
-
-        registry.markDelivered(finalSnap.id, key);
-        const capped = outputManager.capOutputForDelivery(finalSnap.results as any);
-        return {
-          content: [{ type: "text", text: capped.text || finalSnap.summary || "(no output)" }],
-          details: {
-            mode: finalSnap.mode,
-            results: finalSnap.results as any,
-          },
-          isError: finalSnap.state === "failed" || finalSnap.state === "lost",
-        };
-      }
-
-      // Launch tasks
-      const specs: TaskSpec[] = validation.tasks.map((t: ResolvedTask) => ({
-        task: t.task,
-        systemPrompt: t.systemPrompt,
-        model: t.model,
-        thinking: t.thinking,
-        tools: t.effectiveTools,
-        profile: t.profile,
-        cwd: t.cwd,
-        timeoutMs: t.timeoutMs,
-        maxTurns: t.maxTurns,
-        maxCost: t.maxCost,
-        output: t.output,
-        outputMode: t.outputMode,
-        resume: t.resume,
-        forkResume: t.forkResume,
-        isolation: t.isolation,
-        allowSharedWrites: t.allowSharedWrites,
+      const specs: TaskSpec[] = validated.tasks.map((task: ResolvedTask) => ({
+        task: task.task,
+        systemPrompt: task.systemPrompt,
+        model: task.model,
+        thinking: task.thinking,
+        tools: task.effectiveTools,
+        profile: task.profile,
+        canWrite: task.canWrite,
+        cwd: task.cwd,
+        timeoutMs: task.timeoutMs,
+        maxTurns: task.maxTurns,
+        maxCost: task.maxCost,
+        output: task.output,
+        outputMode: task.outputMode,
+        resume: task.resume,
+        forkResume: task.forkResume,
+        isolation: task.isolation,
+        allowSharedWrites: task.allowSharedWrites,
       }));
-
-      // Resume locks
-      for (const t of validation.tasks) {
-        if (t.resume && !t.forkResume) {
-          const ok = registry.acquireResumeLock(t.resume, "pending", key, false);
-          // lock is re-acquired with real id after start
-          if (!ok) {
-            // still may be free; we'll lock with real id
-          }
-        }
-      }
+      const runId = runtime.registry.allocateRunId();
+      const directResumes = validated.tasks.filter((task) => task.resume && !task.forkResume).map((task) => task.resume!);
+      const lock = runtime.registry.acquireResumeLocks(directResumes, runId, runtime.key);
+      if (!lock.ok) fail(`Child session ${lock.conflict!.sessionId} is already active in run ${lock.conflict!.runId}. Use fork_resume:true for an independent continuation.`);
 
       const controller = new AbortController();
-      const combined = signal
-        ? AbortSignal.any
-          ? AbortSignal.any([signal, controller.signal])
-          : controller.signal
-        : controller.signal;
-
-      if (signal) {
-        const onParentAbort = () => controller.abort();
-        if (signal.aborted) controller.abort();
-        else signal.addEventListener("abort", onParentAbort, { once: true });
-      }
-
-      let resolvePromise!: (v: unknown) => void;
-      const donePromise = new Promise((resolve) => {
-        resolvePromise = resolve;
-      });
-
-      const labels = validation.tasks.map((t) => t.label);
-      const runId = registry.start(
-        key,
-        validation.mode === "parallel" ? "parallel" : "single",
-        specs,
-        controller,
-        donePromise,
-        labels,
-      );
-
-      for (const t of validation.tasks) {
-        if (t.resume && !t.forkResume) {
-          registry.acquireResumeLock(t.resume, runId, key, false);
-        }
+      const parentAbort = () => controller.abort();
+      if (signal?.aborted) controller.abort();
+      else signal?.addEventListener("abort", parentAbort, { once: true });
+      let resolveDone!: () => void;
+      const done = new Promise<void>((resolve) => { resolveDone = resolve; });
+      try {
+        runtime.registry.start(runtime.key, validated.mode as "single" | "parallel", specs, controller, done, validated.tasks.map((task) => task.label), runId);
+      } catch (error) {
+        for (const session of directResumes) runtime.registry.releaseResumeLock(session, runtime.key, runId);
+        throw error;
       }
 
       const work = (async () => {
         try {
-          const out = await runTasks(specs, {
-            semaphore: semaphore!,
-            sessionDir: config.sessionDir,
-            worktrees: worktrees!,
-            signal: combined as AbortSignal,
+          const result = await runTasks(specs, {
+            semaphore: runtime.semaphore,
+            sessionDir: runtime.config.sessionDir,
+            worktrees: runtime.worktrees,
+            signal: controller.signal,
             onTaskProgress: (index, partial) => {
-              registry?.checkpoint(runId, key, {
+              if (runtime.closed || current !== runtime) return;
+              runtime.registry.checkpoint(runId, runtime.key, {
                 resultIndex: index,
-                resultUpdate: partial as Partial<TaskResult>,
+                resultUpdate: partial,
                 childSessionId: partial.sessionId,
-                progress: partial.liveText?.slice(0, 120),
+                progress: partial.liveText?.slice(0, 200),
                 turn: partial.usage?.turns,
+                state: partial.state,
               });
-              ensureTimer();
-              refreshStatus();
+              const live = runtime.registry.lookup(runId, runtime.key);
+              if (live.status === "found" && live.run) {
+                const snap = "controller" in live.run ? toSnapshot(live.run) : live.run;
+                onUpdate?.({ content: [{ type: "text", text: formatStatusPreview(snap) }], details: compactDetails(snap.mode, snap.results) });
+              }
             },
           });
-
-          for (const t of validation.tasks) {
-            if (t.resume) registry?.releaseResumeLock(t.resume, key);
-          }
-
-          registry?.complete(runId, key, out.state, out.summary, out.results);
-          footer?.notifyTransition(
-            `Subagent ${runId.slice(0, 8)} ${out.state}`,
-            out.state === "completed" ? "info" : "warn",
-          );
-          refreshStatus();
-          return out;
-        } catch (err: any) {
+          runtime.registry.complete(runId, runtime.key, result.state, result.summary, result.results);
+          return result;
+        } catch (error: any) {
           const failed: TaskResult = {
-            label: "subagent",
-            task: specs[0]?.task ?? "",
-            state: "failed",
-            exitCode: 1,
-            messages: [],
-            stderr: "",
-            usage: {
-              input: 0,
-              output: 0,
-              cacheRead: 0,
-              cacheWrite: 0,
-              cost: 0,
-              contextTokens: 0,
-              turns: 0,
-            },
-            stopReason: "error",
-            errorMessage: err?.message ?? String(err),
-            protocol: {
-              headerSeen: false,
-              assistantEndSeen: false,
-              agentEndSeen: false,
-              validEvents: 0,
-              parseErrors: 0,
-            },
+            label: "task-1", task: specs[0]?.task ?? "", state: "failed", exitCode: 1,
+            messages: [], stderr: "", usage: emptyUsage(), stopReason: "error", errorMessage: error?.message ?? String(error),
+            protocol: { headerSeen: false, assistantEndSeen: false, agentEndSeen: false, validEvents: 0, parseErrors: 0 },
           };
-          registry?.complete(runId, key, "failed", failed.errorMessage, [failed]);
-          refreshStatus();
-          return {
-            mode: "single" as const,
-            results: [failed],
-            state: "failed" as const,
-            summary: failed.errorMessage ?? "error",
-          };
+          runtime.registry.complete(runId, runtime.key, "failed", failed.errorMessage, [failed]);
+          return { mode: "single" as const, results: [failed], state: "failed" as const, summary: failed.errorMessage! };
         } finally {
-          resolvePromise(true);
+          signal?.removeEventListener("abort", parentAbort);
+          for (const session of directResumes) runtime.registry.releaseResumeLock(session, runtime.key, runId);
+          resolveDone();
         }
       })();
 
-      if (validation.async) {
-        ensureTimer();
-        refreshStatus();
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                `Started async subagent run ${runId}. ` +
-                `Use { action: "status"|"wait"|"cancel", id: "${runId}" } or /subagents.`,
-            },
-          ],
-          details: { mode: validation.mode === "parallel" ? "parallel" : "single", results: [] },
-        };
+      if (validated.async) {
+        return { content: [{ type: "text", text: `Started run ${runId}. Use status/wait/cancel with this full id, or open /subagents.` }], details: compactDetails(validated.mode as "single" | "parallel", []) };
       }
-
-      const out = await work;
-      registry.markDelivered(runId, key);
-      const capped = outputManager.capOutputForDelivery(out.results);
-      const isError = out.state === "failed";
-      return {
-        content: [{ type: "text", text: capped.text || out.summary }],
-        details: { mode: out.mode, results: out.results },
-        isError,
-      };
+      const result = await work;
+      runtime.registry.markDelivered(runId, runtime.key);
+      const delivered = runtime.output.capOutputForDelivery(result.results);
+      const text = delivered.text || result.summary;
+      if (result.state === "failed") fail(text);
+      return { content: [{ type: "text", text }], details: compactDetails(result.mode, delivered.cappedResults as any) };
     },
-
-    renderCall(args: any, theme: Theme, context?: { expanded?: boolean; width?: number }) {
-      const expanded = context?.expanded ?? false;
-      const width = context?.width ?? 80;
-      const lines = renderCall(args, {
-        expanded,
-        theme,
-        width,
-        keyHint: keyHint("app.tools.expand", "expand"),
-      });
-      // format.renderCall returns string[]; Pi components often expect Component.
-      // Returning a plain string join is accepted by several tool render paths;
-      // if Component is required, TUI will coerce via String().
-      return lines as any;
+    renderCall(args, theme, context) {
+      const hint = expandHint();
+      return lineComponent((width) => renderCallLines(args, { expanded: context.expanded, theme, width, keyHint: hint }));
     },
-
-    renderResult(
-      result: any,
-      options: { expanded?: boolean; theme?: Theme; width?: number },
-    ) {
-      const theme = options.theme as Theme;
-      const width = options.width ?? 80;
-      const details = result?.details;
-      if (details?.results?.length) {
-        const lines: string[] = [];
-        for (const r of details.results) {
-          lines.push(
-            ...renderResult(r, {
-              expanded: options.expanded ?? false,
-              theme,
-              width,
-            }),
-          );
-        }
-        return lines as any;
+    renderResult(result, options: ToolRenderResultOptions, theme, _context) {
+      const details = result.details as ReturnType<typeof compactDetails> | undefined;
+      if (!details?.results.length) {
+        const text = result.content.find((item) => item.type === "text")?.text ?? "(no output)";
+        return new Text(text, 0, 0);
       }
-      const text = result?.content?.[0]?.text ?? "";
-      return [text] as any;
+      const container = new Container();
+      for (const task of details.results) {
+        container.addChild(lineComponent((width) => {
+          const lines = renderResultLines(task as any, { expanded: options.expanded, theme, width });
+          if (options.expanded && task.finalOutput) {
+            lines.push(...String(task.finalOutput).split("\n").slice(0, 30).map((line) => theme.fg("toolOutput", line)));
+          }
+          return lines;
+        }));
+      }
+      return container;
     },
   });
-
-  // Silence unused in some builds
-  void RUN_ENTRY;
 }

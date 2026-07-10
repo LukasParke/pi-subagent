@@ -4,7 +4,7 @@
 The standalone pi-subagent provides rich TUI support for monitoring, inspecting, and interacting with isolated subagent runs (single and parallel modes). UI logic is kept independent from `runner`/`registry` via small structural adapters (`SubagentAdapter`).
 
 Key features:
-- **Footer status**: Compact live status (running count, ready count, pending delivered). Supports running + completed-undelivered states. Does **not** clear immediately on completion. Shows `/subagents` hint. Notification events are modeled once per terminal transition (debounced).
+- **Footer status**: Compact live status (running count, ready count, and root/subagent/combined provider usage). Supports running + completed-undelivered states and keeps session totals visible after delivery. Shows `/subagents`; notifications fire once per terminal run ID.
 - **/subagents overlay**: Full-screen inspector with list view and detail view. Scrollable transcript/activity. Robust lifecycle (animation timers disposed, requestRender driven).
 - **Formatting layer**: Elapsed time, compact tokens/usage, safe paths, tool call previews, activity with live text + spinners. ANSI-safe width handling (`visibleWidth`, `truncateToWidth`, `wrapTextWithAnsi`).
 - **Parallel support**: Collapsed = one line per task. Expanded works **while tasks are running** (liveText, spinners, elapsed update via single owned animation interval ~8fps). Key hint for `app.tools.expand` (Tab toggles).
@@ -18,7 +18,6 @@ Key features:
 - In list:
   - ↑/↓ or j/k: navigate
   - Enter/return: drill to selected detail
-  - Tab: toggle expanded (live parallel updates)
   - c: cancel running task
   - d: dismiss completed
   - r: resume session
@@ -27,7 +26,7 @@ Key features:
 - In detail:
   - ↑/↓/pg keys: scroll transcript/activity (full messages, tool calls, live text)
   - Esc/b: back to list
-  - Same action keys (c, o, Tab for expand)
+  - Same action keys (c, r, o, d)
 - Footer updates live; notifications for state transitions (e.g. "subagent completed, ready for delivery").
 
 ## States
@@ -41,12 +40,12 @@ Key features:
 ## Integration Notes
 - Extension wires via `ctx.ui.custom((tui, theme, kb, done) => createSubagentsOverlay(tui, theme, adapter, done), {overlay: true})`
 - Adapter provides getActiveRuns/getCompletedRuns/cancelRun etc. without tight coupling.
-- Tests are pure (no real TUI launch): format helpers, UI model state transitions, navigation, expanded parallel, timers/disposal, truncation.
+- Tests combine pure UI models with a headless Pi extension harness: format helpers, navigation, truncation, ready state, renderer contracts, lifecycle actions, timers, and disposal.
 - Status output = metadata/preview only (`formatStatusPreview`).
 - Follows Pi TUI guidelines (render(width), handleInput, invalidate, requestRender, dispose). One owned animation interval.
 
 See ARCHITECTURE.md for ownership boundaries. All rendering respects terminal width and ANSI safety.
 
-Controls fully customizable via ~/.pi/agent/keybindings.json (e.g. `app.tools.expand`, `subagents.navigation.down` etc.).
+Tool-call expansion uses Pi's `app.tools.expand` binding. Overlay navigation currently uses the documented fixed keys above.
 
 Updated: 2026-07-09

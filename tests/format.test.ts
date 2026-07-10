@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import * as format from '../src/format.js';
 import type { UsageStats, RunSnapshot, RunState } from '../src/types.js';
 
@@ -34,7 +36,7 @@ describe('format helpers', () => {
   });
 
   it('formats paths safely', () => {
-    expect(format.formatPath('/Users/luke/test/file.txt')).toContain('~');
+    expect(format.formatPath(path.join(os.homedir(), 'test/file.txt'))).toContain('~');
     expect(format.formatPath('/very/long/path/that/should/be/truncated/for/display')).toMatch(/^\.\.\./);
   });
 

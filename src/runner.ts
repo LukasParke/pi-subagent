@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { TaskResult, TaskSpec, UsageStats } from "./types.js";
 import { emptyUsage } from "./types.js";
-import { ProtocolParser } from "./protocol.js";
+import { ProtocolParser, type ProtocolUpdate } from "./protocol.js";
 import { Semaphore } from "./semaphore.js";
 import { defaultConfig } from "./config.js";
 import { DEPTH_ENV_VAR } from "./policy.js";
@@ -19,390 +19,251 @@ export interface RunnerOptions {
   killGraceMs?: number;
 }
 
-/**
- * Spawns one isolated Pi child for a TaskSpec.
- * Ownership: process lifecycle / protocol / budgets only.
- */
+/** Owns exactly one child Pi process and its process tree. */
 export class ChildRunner {
-  private readonly semaphore: Semaphore;
-  private readonly getPiCommand: GetPiCommand;
-  private readonly sessionDir: string;
-  private readonly onCheckpoint?: (result: Partial<TaskResult>) => void;
-  private readonly killGraceMs: number;
-
   constructor(
-    semaphore: Semaphore = new Semaphore(
-      defaultConfig.maxActiveProcesses,
-      defaultConfig.maxQueuedTasks,
-    ),
-    getPiCommand: GetPiCommand = (args) => ({ command: "pi", args }),
-    sessionDir: string = defaultConfig.sessionDir,
-    onCheckpoint?: (result: Partial<TaskResult>) => void,
-    killGraceMs = 3000,
-  ) {
-    this.semaphore = semaphore;
-    this.getPiCommand = getPiCommand;
-    this.sessionDir = sessionDir;
-    this.onCheckpoint = onCheckpoint;
-    this.killGraceMs = killGraceMs;
-  }
+    private readonly semaphore = new Semaphore(defaultConfig.maxActiveProcesses, defaultConfig.maxQueuedTasks),
+    private readonly getPiCommand: GetPiCommand = (args) => ({ command: "pi", args }),
+    private readonly sessionDir = defaultConfig.sessionDir,
+    private readonly onCheckpoint?: (result: Partial<TaskResult>) => void,
+    private readonly killGraceMs = 3_000,
+  ) {}
 
   async run(spec: TaskSpec, abortSignal?: AbortSignal): Promise<TaskResult> {
     const startedAt = Date.now();
     const result: TaskResult = {
       label: "subagent",
       task: spec.task,
-      state: "running",
+      state: "queued",
       exitCode: null,
       messages: [],
       stderr: "",
       usage: emptyUsage(),
+      outputFile: spec.output,
+      outputMode: spec.outputMode,
+      thinking: spec.thinking,
+      profile: spec.profile,
+      canWrite: spec.canWrite,
       startedAt,
-      protocol: {
-        headerSeen: false,
-        assistantEndSeen: false,
-        agentEndSeen: false,
-        validEvents: 0,
-        parseErrors: 0,
-      },
+      protocol: { headerSeen: false, assistantEndSeen: false, agentEndSeen: false, validEvents: 0, parseErrors: 0 },
     };
 
-    let proc: ChildProcess | null = null;
-    let parser = new ProtocolParser();
-    let tempPromptDir: string | null = null;
-    let timeoutTimer: NodeJS.Timeout | null = null;
-    let killTimer: NodeJS.Timeout | null = null;
-    let terminated = false;
+    let processHandle: ChildProcess | undefined;
     let slotHeld = false;
-    let stderrBuffer = "";
-    const MAX_STDERR = 50 * 1024;
+    let timeout: NodeJS.Timeout | undefined;
+    let forceKillTimer: NodeJS.Timeout | undefined;
+    let tempPromptDir: string | undefined;
+    let requestedStop: "cancelled" | "timeout" | "max_turns" | "max_cost" | undefined;
     let abortHandler: (() => void) | undefined;
+    let stderr = "";
+    const parser = new ProtocolParser();
 
-    const clearTimers = () => {
-      if (timeoutTimer) {
-        clearTimeout(timeoutTimer);
-        timeoutTimer = null;
-      }
-      if (killTimer) {
-        clearTimeout(killTimer);
-        killTimer = null;
+    const release = () => {
+      if (!slotHeld) return;
+      slotHeld = false;
+      this.semaphore.release();
+    };
+
+    const forceKillTree = () => {
+      const pid = processHandle?.pid;
+      if (!pid) return;
+      try {
+        if (process.platform === "win32") {
+          const killer = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
+            shell: false,
+            stdio: "ignore",
+          });
+          killer.unref();
+        } else {
+          process.kill(-pid, "SIGKILL");
+        }
+      } catch (error: any) {
+        if (error?.code !== "ESRCH") {
+          try { processHandle?.kill("SIGKILL"); } catch { /* best effort */ }
+        }
       }
     };
 
-    const detachAbort = () => {
-      if (abortSignal && abortHandler) {
-        abortSignal.removeEventListener("abort", abortHandler);
-        abortHandler = undefined;
+    const requestStop = (reason: typeof requestedStop) => {
+      if (!requestedStop) requestedStop = reason;
+      // Cancellation may arrive before spawn. In that case remember the reason,
+      // then a second call immediately after spawn performs the actual signal.
+      if (forceKillTimer) return;
+      const pid = processHandle?.pid;
+      if (!pid) return;
+      try {
+        if (process.platform === "win32") {
+          const killer = spawn("taskkill", ["/pid", String(pid), "/T"], { shell: false, stdio: "ignore" });
+          killer.unref();
+        } else {
+          process.kill(-pid, "SIGTERM");
+        }
+      } catch (error: any) {
+        if (error?.code !== "ESRCH") {
+          try { processHandle?.kill("SIGTERM"); } catch { /* best effort */ }
+        }
       }
-    };
-
-    const releaseSlot = () => {
-      if (slotHeld) {
-        this.semaphore.release();
-        slotHeld = false;
-      }
+      forceKillTimer = setTimeout(forceKillTree, this.killGraceMs);
+      forceKillTimer.unref?.();
     };
 
     const cleanup = async () => {
-      clearTimers();
-      detachAbort();
-      if (proc) {
-        proc.stdout?.removeAllListeners();
-        proc.stderr?.removeAllListeners();
-        proc.removeAllListeners();
-      }
-      if (tempPromptDir) {
-        try {
-          await fs.rm(tempPromptDir, { recursive: true, force: true });
-        } catch {
-          // ignore
-        }
-        tempPromptDir = null;
-      }
-      releaseSlot();
+      if (timeout) clearTimeout(timeout);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      if (abortSignal && abortHandler) abortSignal.removeEventListener("abort", abortHandler);
+      processHandle?.stdout?.removeAllListeners();
+      processHandle?.stderr?.removeAllListeners();
+      processHandle?.removeAllListeners();
+      if (tempPromptDir) await fs.rm(tempPromptDir, { recursive: true, force: true }).catch(() => {});
+      release();
     };
 
-    const killProcessTree = (signal: NodeJS.Signals = "SIGTERM") => {
-      if (!proc?.pid) return;
-      const pid = proc.pid;
-      try {
-        if (process.platform === "win32") {
-          proc.kill(signal);
-        } else {
-          process.kill(-pid, signal);
-        }
-      } catch (e: any) {
-        if (e?.code !== "ESRCH") {
-          try {
-            proc.kill(signal);
-          } catch {
-            // ignore
-          }
-        }
-      }
-
-      if (signal !== "SIGKILL") {
-        killTimer = setTimeout(() => {
-          try {
-            if (process.platform === "win32") {
-              proc?.kill("SIGKILL");
-            } else if (pid) {
-              process.kill(-pid, "SIGKILL");
-            }
-          } catch {
-            // ignore
-          }
-        }, this.killGraceMs);
-        // Don't keep the process alive solely for kill grace.
-        killTimer.unref?.();
-      }
+    const progress = (partial: Partial<TaskResult>) => {
+      Object.assign(result, partial);
+      this.onCheckpoint?.({ ...result, liveText: parser.getLiveText() });
     };
 
-    const markTerminated = (
-      code: number | null,
-      signal: NodeJS.Signals | undefined,
-      stopReason: string,
-      state: TaskResult["state"],
-    ) => {
-      if (terminated) return;
-      terminated = true;
-      result.endedAt = Date.now();
-      result.state = state;
-      result.exitCode = code;
-      result.signal = signal;
-      result.stopReason = stopReason;
-      if (proc && !proc.killed) killProcessTree(signal ?? "SIGTERM");
+    const handleUpdates = (updates: ProtocolUpdate[]) => {
+      for (const update of updates) {
+        if (update.type === "session") progress({ sessionId: update.sessionId });
+        if (update.type === "live-text") progress({ liveText: update.liveText });
+        if (update.type === "message") {
+          result.messages = parser.getMessages();
+          result.usage = update.usage;
+          progress({ messages: result.messages, usage: result.usage, liveText: parser.getLiveText() });
+          const budget = this.checkBudgets(spec, result.usage);
+          if (budget) requestStop(budget);
+        }
+      }
     };
 
     try {
       if (abortSignal?.aborted) {
-        markTerminated(1, undefined, "cancelled", "cancelled");
+        result.state = "cancelled";
+        result.stopReason = "cancelled";
+        result.exitCode = 1;
+        result.endedAt = Date.now();
         return result;
       }
 
       await this.semaphore.acquire(abortSignal);
       slotHeld = true;
-
-      if (abortSignal?.aborted) {
-        markTerminated(1, undefined, "cancelled", "cancelled");
-        await cleanup();
-        return result;
+      if (abortSignal?.aborted) throw new Error("Subagent cancelled before spawn");
+      if (abortSignal) {
+        abortHandler = () => requestStop("cancelled");
+        abortSignal.addEventListener("abort", abortHandler, { once: true });
       }
+      result.state = "running";
+      progress({ state: "running" });
 
       await fs.mkdir(this.sessionDir, { recursive: true });
-
-      const args: string[] = ["--mode", "json", "-p", "--session-dir", this.sessionDir];
-
-      if (spec.forkResume && spec.resume) {
-        args.push("--fork", spec.resume);
-      } else if (spec.resume) {
-        args.push("--session", spec.resume);
-      }
+      if (abortSignal?.aborted) throw new Error("Subagent cancelled before spawn");
+      const args = ["--mode", "json", "-p", "--session-dir", this.sessionDir];
+      if (spec.forkResume && spec.resume) args.push("--fork", spec.resume);
+      else if (spec.resume) args.push("--session", spec.resume);
       if (spec.model) args.push("--model", spec.model);
       if (spec.thinking) args.push("--thinking", spec.thinking);
-      if (spec.tools?.length) {
-        // Always exclude nested subagent tool to reduce process storms.
-        const tools = spec.tools.filter((t) => t !== "subagent");
+      if (spec.tools !== undefined) {
+        const tools = spec.tools.filter((tool) => tool !== "subagent");
         if (tools.length === 0) args.push("--no-tools");
         else args.push("--tools", tools.join(","));
       }
-
       if (spec.systemPrompt?.trim()) {
         tempPromptDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-subagent-prompt-"));
-        const systemPromptPath = path.join(tempPromptDir, "system-prompt.md");
-        await fs.writeFile(systemPromptPath, spec.systemPrompt, {
-          encoding: "utf-8",
-          mode: 0o600,
-        });
-        args.push("--append-system-prompt", systemPromptPath);
+        const promptPath = path.join(tempPromptDir, "system-prompt.md");
+        await fs.writeFile(promptPath, spec.systemPrompt, { encoding: "utf8", mode: 0o600 });
+        args.push("--append-system-prompt", promptPath);
       }
-
-      // Prompt as trailing argument (also mirrored on stdin for compatibility).
-      args.push(spec.task);
 
       const invocation = this.getPiCommand(args);
       const depth = Number.parseInt(process.env[DEPTH_ENV_VAR] ?? "0", 10) || 0;
-
-      proc = spawn(invocation.command, invocation.args, {
+      processHandle = spawn(invocation.command, invocation.args, {
         cwd: spec.cwd || process.cwd(),
         shell: false,
-        stdio: ["pipe", "pipe", "pipe"],
-        env: {
-          ...process.env,
-          [DEPTH_ENV_VAR]: String(depth + 1),
-        },
         detached: process.platform !== "win32",
+        stdio: ["pipe", "pipe", "pipe"],
+        env: { ...process.env, [DEPTH_ENV_VAR]: String(depth + 1) },
       });
+      if (abortSignal?.aborted) requestStop("cancelled");
 
-      parser = new ProtocolParser();
-
-      const onProgress = (partial: Partial<TaskResult>) => {
-        Object.assign(result, partial);
-        this.onCheckpoint?.({
-          ...result,
-          liveText: parser.getLiveText(),
-        });
-      };
-
-      proc.stdout?.on("data", (chunk: Buffer) => {
-        const update = parser.feed(chunk);
-        if (!update) return;
-
-        if (update.sessionId) {
-          result.sessionId = update.sessionId;
-          onProgress({ sessionId: update.sessionId });
-        }
-        if (update.liveTextDelta) {
-          onProgress({ liveText: parser.getLiveText() });
-        }
-        if (update.newMessage) {
-          result.messages = [...((parser as any).messages ?? result.messages)];
-          onProgress({ messages: result.messages });
-        }
-        if (update.usageUpdate) {
-          result.usage = { ...result.usage, ...update.usageUpdate };
-          onProgress({ usage: result.usage });
-
-          const exceeded = this.checkBudgets(spec, result.usage);
-          if (exceeded && !terminated) {
-            markTerminated(null, undefined, exceeded, "failed");
-          }
-        }
+      processHandle.stdout?.on("data", (chunk: Buffer) => handleUpdates(parser.feed(chunk)));
+      processHandle.stderr?.on("data", (chunk: Buffer) => {
+        stderr = (stderr + chunk.toString()).slice(-50 * 1024);
+        result.stderr = stderr;
       });
-
-      proc.stderr?.on("data", (chunk: Buffer) => {
-        stderrBuffer += chunk.toString();
-        if (stderrBuffer.length > MAX_STDERR) {
-          stderrBuffer = stderrBuffer.slice(-MAX_STDERR);
-        }
-        result.stderr = stderrBuffer;
+      processHandle.stdin?.on("error", (error: NodeJS.ErrnoException) => {
+        // EPIPE is expected when a child fails before consuming stdin.
+        if (error.code !== "EPIPE") result.errorMessage = `stdin error: ${error.message}`;
       });
+      processHandle.stdin?.end(spec.task); // stdin only: no argv duplication or option parsing
 
-      if (proc.stdin) {
-        proc.stdin.write(spec.task);
-        proc.stdin.end();
-      }
+      timeout = setTimeout(() => requestStop("timeout"), spec.timeoutMs);
+      timeout.unref?.();
 
-      if (spec.timeoutMs > 0) {
-        timeoutTimer = setTimeout(() => {
-          if (!terminated) markTerminated(null, undefined, "timeout", "failed");
-        }, spec.timeoutMs);
-        timeoutTimer.unref?.();
-      }
-
-      if (abortSignal) {
-        abortHandler = () => {
-          if (!terminated) markTerminated(null, "SIGTERM", "cancelled", "cancelled");
-        };
-        if (abortSignal.aborted) abortHandler();
-        else abortSignal.addEventListener("abort", abortHandler, { once: true });
-      }
-
-      const closeInfo = await new Promise<{
-        code: number | null;
-        signal: NodeJS.Signals | null;
-        spawnError?: Error;
-      }>((resolve) => {
+      const closed = await new Promise<{ code: number | null; signal: NodeJS.Signals | null; error?: Error }>((resolve) => {
         let settled = false;
-        const done = (info: {
-          code: number | null;
-          signal: NodeJS.Signals | null;
-          spawnError?: Error;
-        }) => {
+        const finish = (value: { code: number | null; signal: NodeJS.Signals | null; error?: Error }) => {
           if (settled) return;
           settled = true;
-          resolve(info);
+          resolve(value);
         };
-
-        proc!.on("close", (code, signal) => done({ code, signal }));
-        proc!.on("error", (err) => {
-          result.errorMessage = `Spawn error: ${err.message}`;
-          done({ code: 1, signal: null, spawnError: err });
-        });
+        processHandle!.once("close", (code, signal) => finish({ code, signal }));
+        processHandle!.once("error", (error) => finish({ code: 1, signal: null, error }));
       });
 
-      const finalized = parser.finalize(closeInfo.code, closeInfo.signal ?? undefined, stderrBuffer);
-      // Keep task label/input
-      finalized.task = spec.task;
-      finalized.label = result.label;
-      finalized.startedAt = startedAt;
-      finalized.endedAt = Date.now();
-      finalized.sessionId = result.sessionId ?? finalized.sessionId;
-      finalized.usage = {
-        ...finalized.usage,
-        // prefer live accumulated usage if present
-        ...(result.usage.turns > finalized.usage.turns ? result.usage : {}),
-      };
-      if (result.messages.length > finalized.messages.length) {
-        finalized.messages = result.messages;
-      }
+      handleUpdates(parser.flush());
+      // The child owns a dedicated process group. Reap descendants even when the
+      // direct Pi process exits normally after a tool backgrounds work.
+      forceKillTree();
+      const finalized = parser.finalize(closed.code, closed.signal ?? undefined, stderr);
+      Object.assign(result, finalized, {
+        label: result.label,
+        task: spec.task,
+        outputFile: spec.output,
+        outputMode: spec.outputMode,
+        thinking: spec.thinking,
+        profile: spec.profile,
+        canWrite: spec.canWrite,
+        startedAt,
+        endedAt: Date.now(),
+      });
 
-      if (terminated) {
-        // Preserve explicit termination reason/state from timeout/cancel/budget.
-        finalized.state = result.state;
-        finalized.stopReason = result.stopReason;
-        finalized.exitCode = result.exitCode;
-        finalized.signal = result.signal;
-        finalized.errorMessage = result.errorMessage ?? finalized.errorMessage;
-      } else if (closeInfo.signal || closeInfo.code === null) {
-        finalized.state = "cancelled";
-        finalized.stopReason = "cancelled";
-        finalized.exitCode = closeInfo.code;
-        finalized.signal = closeInfo.signal ?? undefined;
-        if (!finalized.errorMessage) {
-          finalized.errorMessage = `Subagent terminated by ${closeInfo.signal ?? "unknown signal"}`;
-        }
-      } else {
-        const budgetStop = this.checkBudgets(spec, finalized.usage);
-        if (budgetStop) {
-          finalized.state = "failed";
-          finalized.stopReason = budgetStop;
-        } else if (!finalized.protocol.headerSeen || !finalized.protocol.assistantEndSeen) {
-          finalized.state = "failed";
-          finalized.stopReason = "protocol_error";
-          if (finalized.exitCode === 0) finalized.exitCode = 1;
-          finalized.errorMessage =
-            finalized.errorMessage ||
-            "Child exited without a complete Pi JSON protocol response (session header + assistant message).";
-        }
+      if (closed.error) {
+        result.state = "failed";
+        result.stopReason = "spawn_error";
+        result.errorMessage = closed.error.message;
+      } else if (requestedStop) {
+        result.state = requestedStop === "cancelled" ? "cancelled" : "failed";
+        result.stopReason = requestedStop;
+        result.exitCode = closed.code;
       }
-
-      Object.assign(result, finalized);
-      await cleanup();
       return result;
-    } catch (err: any) {
-      if (!terminated) {
-        result.errorMessage = err?.message ?? String(err);
-        result.state =
-          /aborted/i.test(result.errorMessage ?? "") || abortSignal?.aborted
-            ? "cancelled"
-            : "failed";
-        result.stopReason = result.state === "cancelled" ? "cancelled" : "error";
-        result.endedAt = Date.now();
-        result.exitCode = result.exitCode ?? 1;
-      }
-      await cleanup();
+    } catch (error: any) {
+      result.state = abortSignal?.aborted || /cancel/i.test(String(error?.message)) ? "cancelled" : "failed";
+      result.stopReason = result.state === "cancelled" ? "cancelled" : "error";
+      result.errorMessage = error?.message ?? String(error);
+      result.exitCode ??= 1;
+      result.endedAt = Date.now();
       return result;
+    } finally {
+      await cleanup();
     }
   }
 
-  private checkBudgets(spec: TaskSpec, usage: UsageStats): "max_turns" | "max_cost" | null {
+  private checkBudgets(spec: TaskSpec, usage: UsageStats): "max_turns" | "max_cost" | undefined {
+    // Stop only after a completed turn has pushed usage beyond the configured ceiling.
     if (spec.maxTurns !== undefined && usage.turns > spec.maxTurns) return "max_turns";
     if (spec.maxCost !== undefined && usage.cost > spec.maxCost) return "max_cost";
-    return null;
+    return undefined;
   }
 }
 
-export async function runSubagent(
-  spec: TaskSpec,
-  options?: RunnerOptions & { signal?: AbortSignal },
-): Promise<TaskResult> {
-  const runner = new ChildRunner(
-    options?.semaphore,
-    options?.getPiCommand,
-    options?.sessionDir,
-    options?.onCheckpoint,
-    options?.killGraceMs,
-  );
-  return runner.run(spec, options?.signal);
+export function runSubagent(spec: TaskSpec, options: RunnerOptions & { signal?: AbortSignal } = {}): Promise<TaskResult> {
+  return new ChildRunner(
+    options.semaphore,
+    options.getPiCommand,
+    options.sessionDir,
+    options.onCheckpoint,
+    options.killGraceMs,
+  ).run(spec, options.signal);
 }

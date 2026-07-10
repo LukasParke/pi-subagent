@@ -39,18 +39,20 @@ describe("policy", () => {
     expect(res.tasks[0]!.timeoutMs).toBeGreaterThan(0);
   });
 
-  it("explore/review strip write tools including bash", () => {
-    const res = validateSubagentRequest(
-      { task: "Search", profile: "explore", tools: ["read", "bash", "edit", "web_search"] },
+  it("explore/review fail closed on write or unclassified tools", () => {
+    const unsafe = validateSubagentRequest(
+      { task: "Search", profile: "explore", tools: ["read", "bash"] },
       parent,
     );
-    expect(res.ok).toBe(true);
-    if (!res.ok) return;
-    const tools = res.tasks[0]!.effectiveTools;
-    for (const w of WRITE_TOOLS) expect(tools).not.toContain(w);
-    expect(tools).toContain("read");
-    expect(tools).toContain("web_search");
-    expect(res.tasks[0]!.canWrite).toBe(false);
+    expect(unsafe.ok).toBe(false);
+    const safe = validateSubagentRequest(
+      { task: "Search", profile: "explore", tools: ["read", "web_search"] },
+      parent,
+    );
+    expect(safe.ok).toBe(true);
+    if (!safe.ok) return;
+    for (const w of WRITE_TOOLS) expect(safe.tasks[0]!.effectiveTools).not.toContain(w);
+    expect(safe.tasks[0]!.canWrite).toBe(false);
   });
 
   it("defaults parallel tasks to explore", () => {

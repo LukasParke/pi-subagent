@@ -1,105 +1,57 @@
 #!/usr/bin/env node
 import { fileURLToPath } from "node:url";
 
-const __filename = fileURLToPath(import.meta.url);
-const isMain =
-  process.argv[1] === __filename || process.argv[1]?.endsWith("fake-pi.mjs");
-
-const RESPONSES = {
-  success: {
-    header: { type: "session", id: "test-session-123" },
-    updates: [
-      {
-        type: "message_update",
-        message: { role: "assistant", content: [{ type: "text", text: "Hello" }] },
-      },
-      {
-        type: "message_update",
-        message: { role: "assistant", content: [{ type: "text", text: " world!" }] },
-      },
-    ],
-    end: {
-      type: "message_end",
-      message: {
-        role: "assistant",
-        content: [
-          { type: "text", text: "Hello" },
-          { type: "text", text: " world!" },
-        ],
-        model: "fake/model",
-        stopReason: "stop",
-        usage: {
-          input: 10,
-          output: 5,
-          cacheRead: 0,
-          cacheWrite: 0,
-          cost: { total: 0.001 },
-          totalTokens: 15,
-        },
-      },
+const filename = fileURLToPath(import.meta.url);
+const isMain = process.argv[1] === filename || process.argv[1]?.endsWith("fake-pi.mjs");
+const header = { type: "session", version: 3, id: "test-session-123", timestamp: new Date().toISOString(), cwd: process.cwd() };
+const message = {
+  type: "message_end",
+  message: {
+    role: "assistant",
+    content: [{ type: "text", text: "Hello" }, { type: "text", text: " world!" }],
+    api: "fake", provider: "fake", model: "fake/model", stopReason: "stop", timestamp: Date.now(),
+    usage: {
+      input: 10, output: 5, cacheRead: 0, cacheWrite: 0, reasoning: 1, totalTokens: 15,
+      cost: { input: 0.0004, output: 0.0006, cacheRead: 0, cacheWrite: 0, total: 0.001 },
     },
-    agentEnd: { type: "agent_end" },
   },
 };
+const agentEnd = { type: "agent_end", messages: [message.message] };
 
 if (isMain) {
   const mode = process.env.FAKE_PI_MODE || "success";
-  const delayMs = Number(process.env.FAKE_PI_DELAY_MS || "0");
-
-  let stdin = "";
-  process.stdin.on("data", (c) => {
-    stdin += c.toString();
-  });
-
+  const delay = Number(process.env.FAKE_PI_DELAY_MS || 0);
+  let input = "";
+  process.stdin.on("data", (chunk) => { input += chunk.toString(); });
   process.stdin.on("end", async () => {
-    if (delayMs > 0) {
-      await new Promise((r) => setTimeout(r, delayMs));
-    }
-
-    const emit = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
-
-    if (mode === "error") {
-      process.stderr.write("Some stderr\n");
-      process.exit(1);
-    }
-
-    if (mode === "signal") {
-      // Stay alive until killed
-      setInterval(() => {}, 1000);
-      return;
-    }
-
-    if (mode === "incomplete") {
-      // session header only — no assistant message_end
-      emit({ type: "session", id: "incomplete-456" });
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+    const emit = (value, newline = true) => process.stdout.write(JSON.stringify(value) + (newline ? "\n" : ""));
+    if (mode === "signal") return void setInterval(() => {}, 1000);
+    if (mode === "error") { process.stderr.write("Some stderr\n"); process.exit(1); return; }
+    if (mode === "incomplete") { emit(header); process.exit(0); return; }
+    if (mode === "nonzero-complete") { emit(header); emit(message); emit(agentEnd); process.exit(1); return; }
+    if (mode === "provider-error") {
+      emit(header);
+      emit({ ...message, message: { ...message.message, stopReason: "error", errorMessage: "provider failed" } });
+      emit(agentEnd);
       process.exit(0);
       return;
     }
-
-    if (mode === "malformed") {
-      process.stdout.write("not json\n");
-      emit(RESPONSES.success.header);
-      process.stdout.write("invalid json {\n");
-      emit(RESPONSES.success.updates[0]);
-      emit(RESPONSES.success.end);
-      emit(RESPONSES.success.agentEnd);
-      process.exit(0);
-      return;
+    if (mode === "malformed") process.stdout.write("not-json\n");
+    // Deliberately batch events; optionally pause after billed message usage.
+    const update = { type: "message_update", message: { role: "assistant", content: [] }, assistantMessageEvent: { type: "text_delta", delta: "Hello" } };
+    if (mode === "pause-after-message") {
+      process.stdout.write([header, update, message].map((value) => JSON.stringify(value)).join("\n") + "\n");
+      await new Promise((resolve) => setTimeout(resolve, Number(process.env.FAKE_PI_PAUSE_MS || 250)));
+      emit(agentEnd);
+    } else {
+      process.stdout.write([header, update, message, agentEnd].map((value) => JSON.stringify(value)).join("\n") + (mode === "unterminated" ? "" : "\n"));
     }
-
-    // success (default)
-    void stdin;
-    emit(RESPONSES.success.header);
-    for (const u of RESPONSES.success.updates) emit(u);
-    emit(RESPONSES.success.end);
-    emit(RESPONSES.success.agentEnd);
+    void input;
     process.exit(0);
   });
 }
 
 export function getFakePiCommand() {
-  return {
-    command: process.execPath,
-    args: [__filename],
-  };
+  return { command: process.execPath, args: [filename] };
 }

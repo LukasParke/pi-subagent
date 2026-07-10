@@ -54,18 +54,30 @@ describe("WorktreeManager", () => {
     await mgr.forceRemove(handle);
   });
 
-  it("auto-cleans unchanged worktrees and preserves changed ones", async () => {
+  it("auto-cleans unchanged worktrees and preserves uncommitted changes", async () => {
     const clean = await mgr.create(repo, "clean");
     const cleaned = await mgr.finalize(clean);
     expect(cleaned.changed).toBe(false);
+    await expect(fs.stat(clean.cwd)).rejects.toThrow();
 
     const dirty = await mgr.create(repo, "dirty");
     await fs.writeFile(path.join(dirty.cwd, "extra.txt"), "change\n");
     const preserved = await mgr.finalize(dirty);
     expect(preserved.changed).toBe(true);
-    expect(preserved.diffSummary || true).toBeTruthy();
-    // still exists
     await fs.stat(preserved.cwd);
+    await mgr.forceRemove(preserved);
+  });
+
+  it("preserves committed child changes and branch", async () => {
+    const committed = await mgr.create(repo, "committed");
+    await fs.writeFile(path.join(committed.cwd, "committed.txt"), "important\n");
+    await run("git", ["add", "."], committed.cwd);
+    await run("git", ["commit", "-m", "child work"], committed.cwd);
+    const preserved = await mgr.finalize(committed);
+    expect(preserved.changed).toBe(true);
+    await fs.stat(preserved.cwd);
+    const branch = await run("git", ["show-ref", "--verify", `refs/heads/${preserved.branch}`], repo);
+    expect(branch.code).toBe(0);
     await mgr.forceRemove(preserved);
   });
 

@@ -40,19 +40,19 @@ describe('UI Models', () => {
 
   it('footer supports running and completed-undelivered states', () => {
     const theme = { fg: (_: string, t: string) => t, muted: (t: string) => t } as any;
-    footer.update(3, 1); // 3 running, 1 undelivered
+    footer.update(3);
     const status = footer.render(theme, 80);
     expect(status).toContain('3 running');
     expect(status).toContain('2 ready');
-    expect(status).toContain('/1 pending');
     expect(status).toContain('/subagents');
   });
 
-  it('notification debounced per terminal transition', () => {
+  it('notifies exactly once per terminal run id', () => {
     const notifySpy = vi.spyOn(adapter, 'notify');
-    footer.notifyTransition('test1');
-    footer.notifyTransition('test2'); // should debounce
-    expect(notifySpy).toHaveBeenCalledTimes(1);
+    footer.notifyTerminal('run-1', 'done');
+    footer.notifyTerminal('run-1', 'done again');
+    footer.notifyTerminal('run-2', 'done');
+    expect(notifySpy).toHaveBeenCalledTimes(2);
   });
 
   it('pure UI model navigation, actions, ready state', () => {

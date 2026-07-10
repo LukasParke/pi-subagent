@@ -1,16 +1,8 @@
-import type { Theme } from '@earendil-works/pi-coding-agent';
-import type { TUI, Component, OverlayHandle } from '@earendil-works/pi-tui';
-import type { RunSnapshot, RunState, UsageStats } from './types.js';
-import * as format from './format.js';
-import { matchesKey, truncateToWidth, wrapTextWithAnsi } from '@earendil-works/pi-tui';
-import { EventEmitter } from 'node:events';
-
-/**
- * UI layer for standalone pi-subagent.
- * Independent via structural adapters.
- * Owns: footer status, /subagents overlay, renderers.
- * Prefers event-driven requestRender(). Only one animation timer.
- */
+import type { Theme } from "@earendil-works/pi-coding-agent";
+import type { Component, TUI } from "@earendil-works/pi-tui";
+import { matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import type { RunSnapshot } from "./types.js";
+import { formatStatusPreview, SPINNERS } from "./format.js";
 
 export interface SubagentAdapter {
   getActiveRuns(): RunSnapshot[];
@@ -21,406 +13,222 @@ export interface SubagentAdapter {
   resumeRun(id: string): Promise<void>;
   showOutput(id: string): void;
   getReadyCount(): number;
-  notify?(message: string, level?: 'info' | 'warn' | 'error'): void;
+  getUsageSummary?(): string;
+  subscribe?(listener: () => void): () => void;
+  notify?(message: string, level?: "info" | "warn" | "error"): void;
 }
 
 export interface UIAction {
-  type: 'cancel' | 'dismiss' | 'resume' | 'output' | 'close' | 'select';
+  type: "cancel" | "dismiss" | "resume" | "output" | "close" | "select";
   id?: string;
-  payload?: any;
 }
 
 export class FooterStatusModel {
-  private adapter: SubagentAdapter;
-  private lastNotification = 0;
-  private runningCount = 0;
-  private deliveredCount = 0;
-  private _onUpdate?: () => void;
+  constructor(private readonly adapter: SubagentAdapter) {}
+  private running = 0;
+  private onUpdate?: () => void;
+  private notified = new Set<string>();
 
-  constructor(adapter: SubagentAdapter) {
-    this.adapter = adapter;
+  setOnUpdate(callback: () => void): void { this.onUpdate = callback; }
+  update(running: number, _readyHint?: number): void {
+    if (running !== this.running) {
+      this.running = running;
+      this.onUpdate?.();
+    }
   }
-
-  setOnUpdate(cb: () => void) {
-    this._onUpdate = cb;
-  }
-
-  update(running: number, delivered: number) {
-    const changed = this.runningCount !== running || this.deliveredCount !== delivered;
-    this.runningCount = running;
-    this.deliveredCount = delivered;
-    if (changed && this._onUpdate) this._onUpdate();
-  }
-
-  /** Status for footer. Supports running and completed-undelivered. Does not immediately clear. */
   render(theme: Theme, width: number): string {
     const ready = this.adapter.getReadyCount();
-    const active = this.runningCount;
-    const pending = this.deliveredCount; // completed but not yet delivered to user
-    let status = theme.fg('muted', 'subagents: ');
-    if (active > 0) {
-      status += theme.fg('warning', `${active} running `);
-    }
-    status += theme.fg('dim', `${ready} ready`);
-    if (pending > 0) {
-      status += theme.fg('accent', ` /${pending} pending`);
-    }
-    status += theme.fg('muted', ' • /subagents');
-    return truncateToWidth(status, width);
+    const parts = [
+      this.running ? theme.fg("warning", `${this.running} running`) : "",
+      ready ? theme.fg("success", `${ready} ready`) : "",
+      this.adapter.getUsageSummary?.() ?? "",
+      "/subagents",
+    ].filter(Boolean);
+    return truncateToWidth(parts.join(" · "), width);
   }
-
-  /** Notification events modeled once per terminal transition. */
-  notifyTransition(message: string, level: 'info' | 'warn' = 'info') {
-    const now = Date.now();
-    if (now - this.lastNotification > 250) { // debounce per transition
-      this.adapter.notify?.(message, level);
-      this.lastNotification = now;
-      if (this._onUpdate) this._onUpdate();
-    }
+  notifyTerminal(id: string, message: string, level: "info" | "warn" = "info"): void {
+    if (this.notified.has(id)) return;
+    this.notified.add(id);
+    this.adapter.notify?.(message, level);
+    this.onUpdate?.();
   }
-
-  dispose() {
-    this._onUpdate = undefined;
+  notifyTransition(message: string, level: "info" | "warn" = "info"): void {
+    this.notifyTerminal(message, message, level);
   }
+  dispose(): void { this.onUpdate = undefined; this.notified.clear(); }
 }
 
-interface SubagentsModel {
-  listMode: boolean;
-  selectedIndex: number;
-  detailId?: string;
-  scrollOffset: number;
-  expanded: boolean; // for live parallel
+function runTranscript(run: RunSnapshot): string {
+  const sections: string[] = [];
+  if (run.summary) sections.push(`Summary\n${run.summary}`);
+  run.results.forEach((result, index) => {
+    const header = `${index + 1}. ${result.label} [${result.state}]`;
+    const usage = `$${result.usage.cost.toFixed(4)} · in ${result.usage.input} · out ${result.usage.output}`;
+    const capability = `${result.profile ?? "general"}/${result.canWrite ? "RW" : "RO"}${result.thinking ? ` · thinking:${result.thinking}` : ""}${result.model ? ` · ${result.model}` : ""}`;
+    const pointers = [
+      result.outputFile ? `Output: ${result.outputFile}` : "",
+      result.sessionId ? `Session: ${result.sessionId}` : "",
+      result.worktree ? `Worktree: ${result.worktree.cwd}\nBranch: ${result.worktree.branch}` : "",
+    ].filter(Boolean).join("\n");
+    sections.push([header, capability, usage, result.transcript || result.finalOutput || result.errorMessage || "(no output)", pointers].filter(Boolean).join("\n"));
+  });
+  return sections.join("\n\n") || run.taskPreviews.join("\n") || "(no transcript available)";
 }
 
 export class SubagentsOverlay implements Component {
-  private tui: TUI;
-  private theme: Theme;
-  private done: (result?: any) => void;
-  private adapter: SubagentAdapter;
-  private model: SubagentsModel = {
-    listMode: true,
-    selectedIndex: 0,
-    scrollOffset: 0,
-    expanded: false,
-  };
-  private animationFrame = 0;
-  private animationInterval?: NodeJS.Timeout;
-  private emitter = new EventEmitter();
-  private cachedLines?: string[];
-  private cachedWidth = 0;
-  private isDisposed = false;
+  wantsKeyRelease = false;
+  private selected = 0;
+  private detailId?: string;
+  private scroll = 0;
+  private frame = 0;
+  private timer?: NodeJS.Timeout;
+  private unsubscribe?: () => void;
+  private disposed = false;
 
-  constructor(tui: TUI, theme: Theme, done: (result?: any) => void, adapter: SubagentAdapter) {
-    this.tui = tui;
-    this.theme = theme;
-    this.done = done;
-    this.adapter = adapter;
-    this.startAnimation();
+  constructor(
+    private readonly tui: TUI,
+    private readonly theme: Theme,
+    private readonly done: () => void,
+    private readonly adapter: SubagentAdapter,
+  ) {
+    this.unsubscribe = this.adapter.subscribe?.(() => {
+      if (this.disposed) return;
+      this.syncAnimation();
+      this.invalidate();
+      this.tui.requestRender();
+    });
+    this.syncAnimation();
   }
 
-  private startAnimation() {
-    if (this.animationInterval || this.isDisposed) return;
-    this.animationInterval = setInterval(() => {
-      if (this.hasRunningTasks() && !this.isDisposed) {
-        this.animationFrame = (this.animationFrame + 1) % format.SPINNERS.length;
-        this.invalidate();
-        this.requestRender();
-      } else if (this.animationInterval) {
-        clearInterval(this.animationInterval);
-        this.animationInterval = undefined;
-      }
-    }, 120); // ~8fps for spinner
-  }
-
-  private hasRunningTasks(): boolean {
-    return this.adapter.getActiveRuns().some(r => r.state === 'running');
-  }
-
-  private requestRender() {
-    // event-driven via TUI handle if available, but since overlay, we use invalidate which triggers re-render
-    this.invalidate();
-  }
-
-  handleInput(data: string): void {
-    if (this.isDisposed) return;
-
-    const runs = this.getVisibleRuns();
-
-    if (matchesKey(data, 'escape') || matchesKey(data, 'q')) {
-      this.close();
-      return;
-    }
-
-    if (this.model.listMode) {
-      this.handleListInput(data, runs);
-    } else {
-      this.handleDetailInput(data);
-    }
-    this.invalidate();
-    this.requestRender();
-  }
-
-  private handleListInput(data: string, runs: RunSnapshot[]) {
-    if (matchesKey(data, 'down') || matchesKey(data, 'j')) {
-      this.model.selectedIndex = Math.min(this.model.selectedIndex + 1, runs.length - 1);
-    } else if (matchesKey(data, 'up') || matchesKey(data, 'k')) {
-      this.model.selectedIndex = Math.max(this.model.selectedIndex - 1, 0);
-    } else if (matchesKey(data, 'return') && runs.length > 0) {
-      const selected = runs[this.model.selectedIndex];
-      if (selected) {
-        this.model.listMode = false;
-        this.model.detailId = selected.id;
-        this.model.scrollOffset = 0;
-        this.model.expanded = true; // default expanded for details
-      }
-    } else if (matchesKey(data, 'c') && runs.length > 0) {
-      const selected = runs[this.model.selectedIndex];
-      if (selected?.state === 'running') {
-        this.adapter.cancelRun(selected.id);
-        this.emitter.emit('action', { type: 'cancel', id: selected.id } as UIAction);
-      }
-    } else if (matchesKey(data, 'd')) {
-      const selected = runs[this.model.selectedIndex];
-      if (selected) {
-        this.adapter.dismissRun(selected.id);
-        this.emitter.emit('action', { type: 'dismiss', id: selected.id } as UIAction);
-        if (this.model.selectedIndex >= runs.length - 1) this.model.selectedIndex = Math.max(0, runs.length - 2);
-      }
-    } else if (matchesKey(data, 'r')) {
-      const selected = runs[this.model.selectedIndex];
-      if (selected) {
-        this.adapter.resumeRun(selected.id).catch(console.error);
-        this.emitter.emit('action', { type: 'resume', id: selected.id } as UIAction);
-      }
-    } else if (matchesKey(data, 'o')) {
-      const selected = runs[this.model.selectedIndex];
-      if (selected) {
-        this.adapter.showOutput(selected.id);
-        this.emitter.emit('action', { type: 'output', id: selected.id } as UIAction);
-      }
-    } else if (matchesKey(data, 'tab')) {
-      this.model.expanded = !this.model.expanded;
-    }
-  }
-
-  private handleDetailInput(data: string) {
-    if (matchesKey(data, 'escape') || matchesKey(data, 'b') || matchesKey(data, 'backspace')) {
-      this.model.listMode = true;
-      this.model.detailId = undefined;
-      return;
-    }
-    if (matchesKey(data, 'down') || matchesKey(data, 'j')) {
-      this.model.scrollOffset += 1;
-    } else if (matchesKey(data, 'up') || matchesKey(data, 'k')) {
-      this.model.scrollOffset = Math.max(0, this.model.scrollOffset - 1);
-    } else if (matchesKey(data, 'c')) {
-      const detail = this.getCurrentDetail();
-      if (detail && detail.state === 'running') {
-        this.adapter.cancelRun(detail.id);
-        this.emitter.emit('action', { type: 'cancel', id: detail.id });
-      }
-    } else if (matchesKey(data, 'o')) {
-      const detail = this.getCurrentDetail();
-      if (detail) {
-        this.adapter.showOutput(detail.id);
-        this.emitter.emit('action', { type: 'output', id: detail.id });
-      }
-    } else if (matchesKey(data, 'tab')) {
-      this.model.expanded = !this.model.expanded;
-    }
-  }
-
-  private getVisibleRuns(): RunSnapshot[] {
+  private runs(): RunSnapshot[] {
     return [...this.adapter.getActiveRuns(), ...this.adapter.getCompletedRuns()];
   }
 
-  private getCurrentDetail(): RunSnapshot | null {
-    if (!this.model.detailId) return null;
-    return this.adapter.getRunById(this.model.detailId);
+  private syncAnimation(): void {
+    const running = this.adapter.getActiveRuns().length > 0;
+    if (running && !this.timer && !this.disposed) {
+      this.timer = setInterval(() => {
+        this.frame = (this.frame + 1) % SPINNERS.length;
+        this.invalidate();
+        this.tui.requestRender();
+        if (this.adapter.getActiveRuns().length === 0) this.stopAnimation();
+      }, 120);
+      this.timer.unref?.();
+    } else if (!running) {
+      this.stopAnimation();
+    }
+  }
+
+  private stopAnimation(): void {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = undefined;
+  }
+
+  handleInput(data: string): void {
+    const runs = this.runs();
+    if (this.detailId) {
+      if (matchesKey(data, "escape") || matchesKey(data, "backspace") || data === "b") {
+        this.detailId = undefined;
+        this.scroll = 0;
+      } else if (matchesKey(data, "down") || data === "j") this.scroll++;
+      else if (matchesKey(data, "up") || data === "k") this.scroll = Math.max(0, this.scroll - 1);
+      else this.handleAction(data, this.adapter.getRunById(this.detailId));
+    } else if (matchesKey(data, "escape") || data === "q") {
+      this.close();
+      return;
+    } else if (matchesKey(data, "down") || data === "j") {
+      this.selected = Math.min(Math.max(0, runs.length - 1), this.selected + 1);
+    } else if (matchesKey(data, "up") || data === "k") {
+      this.selected = Math.max(0, this.selected - 1);
+    } else if (matchesKey(data, "enter") && runs[this.selected]) {
+      this.detailId = runs[this.selected]!.id;
+      this.scroll = 0;
+    } else {
+      this.handleAction(data, runs[this.selected] ?? null);
+    }
+    this.syncAnimation();
+    this.invalidate();
+    this.tui.requestRender();
+  }
+
+  private handleAction(data: string, run: RunSnapshot | null): void {
+    if (!run) return;
+    if (data === "c" && ["queued", "running"].includes(run.state)) this.adapter.cancelRun(run.id);
+    if (data === "d") this.adapter.dismissRun(run.id);
+    if (data === "r") void this.adapter.resumeRun(run.id);
+    if (data === "o") this.adapter.showOutput(run.id);
   }
 
   render(width: number): string[] {
-    if (this.isDisposed) return ['[disposed]'];
+    this.syncAnimation();
+    const lines = [truncateToWidth(this.theme.bold(this.theme.fg("toolTitle", "Subagents")), width)];
+    const usage = this.adapter.getUsageSummary?.();
+    if (usage) lines.push(truncateToWidth(this.theme.fg("muted", usage), width));
+    lines.push("");
 
-    if (this.cachedLines && this.cachedWidth === width) {
-      return this.cachedLines;
-    }
-
-    const lines: string[] = [];
-    const header = this.theme.bold(this.theme.fg('toolTitle', ' /subagents '));
-    lines.push(truncateToWidth(header + this.theme.fg('muted', '(Esc to close)'), width));
-
-    if (this.model.listMode) {
-      this.renderListScreen(lines, width);
-    } else {
-      this.renderDetailScreen(lines, width);
-    }
-
-    // Footer hint
-    const hints = ['↑↓ navigate', 'Enter detail', 'c cancel', 'd dismiss', 'r resume', 'o output', 'Tab expand', 'Esc close'];
-    lines.push('');
-    lines.push(truncateToWidth(this.theme.fg('dim', hints.join(' • ')), width));
-
-    this.cachedLines = lines;
-    this.cachedWidth = width;
-    return lines;
-  }
-
-  private renderListScreen(lines: string[], width: number) {
-    const runs = this.getVisibleRuns();
-    if (runs.length === 0) {
-      lines.push(this.theme.fg('muted', '  No subagents. Use subagent tool or /subagents to manage.'));
-      return;
-    }
-
-    runs.forEach((run, idx) => {
-      const isSelected = idx === this.model.selectedIndex;
-      const prefix = isSelected ? this.theme.fg('accent', '▶ ') : '  ';
-      const spinnerFrame = this.animationFrame;
-      const opts: format.RenderOptions = {
-        expanded: this.model.expanded,
-        theme: this.theme,
-        width: width - 4,
-        spinnerFrame,
-      };
-      const rendered = format.renderResult(run, opts);
-      const firstLine = rendered[0] || format.formatStatusPreview(run);
-      const line = prefix + firstLine;
-      lines.push(truncateToWidth(line, width));
-      if (isSelected && this.model.expanded && rendered.length > 1) {
-        rendered.slice(1, 4).forEach(l => lines.push('    ' + truncateToWidth(l, width - 4)));
+    if (this.detailId) {
+      const run = this.adapter.getRunById(this.detailId);
+      if (!run) lines.push(this.theme.fg("error", "Run no longer exists"));
+      else {
+        lines.push(truncateToWidth(formatStatusPreview(run), width));
+        lines.push("");
+        const wrappedValue = wrapTextWithAnsi(runTranscript(run), Math.max(1, width - 2));
+        const wrapped = Array.isArray(wrappedValue) ? wrappedValue : String(wrappedValue).split("\n");
+        for (const line of wrapped.slice(this.scroll, this.scroll + 20)) lines.push(`  ${truncateToWidth(line, width - 2)}`);
+        if (wrapped.length > this.scroll + 20) lines.push(this.theme.fg("muted", `  … ${wrapped.length - this.scroll - 20} more`));
+        lines.push("");
+        lines.push(this.theme.fg("dim", "↑↓ scroll · b/Esc back · c cancel · r resume · o output · d dismiss"));
       }
-    });
-  }
-
-  private renderDetailScreen(lines: string[], width: number) {
-    const detail = this.getCurrentDetail();
-    if (!detail) {
-      lines.push(this.theme.fg('error', 'No detail available'));
-      lines.push(this.theme.fg('muted', 'Esc to return to list'));
-      return;
+    } else {
+      const runs = this.runs();
+      if (!runs.length) lines.push(this.theme.fg("muted", "No subagent runs in this branch."));
+      runs.forEach((run, index) => {
+        const prefix = index === this.selected ? this.theme.fg("accent", "▶ ") : "  ";
+        const spinner = ["queued", "running"].includes(run.state) ? `${SPINNERS[this.frame]} ` : "";
+        lines.push(truncateToWidth(prefix + spinner + formatStatusPreview(run), width));
+      });
+      lines.push("");
+      lines.push(this.theme.fg("dim", "↑↓ select · Enter details · c cancel · r resume · o output · d dismiss · Esc close"));
     }
-
-    const opts: format.RenderOptions = {
-      expanded: true,
-      theme: this.theme,
-      width: width - 2,
-      spinnerFrame: this.animationFrame,
-      liveText: (detail as any).liveText,
-    };
-    const rendered = format.renderResult(detail, opts);
-    rendered.forEach(l => lines.push(l));
-
-    lines.push('');
-    lines.push(this.theme.bold(this.theme.fg('muted', '── Full Transcript / Activity ──')));
-
-    // Scrollable full transcript/activity (simulated from messages or summary)
-    const transcript = this.getTranscript(detail);
-    const transcriptWrapped = wrapTextWithAnsi(transcript, width - 4);
-    const wrapped = String(transcriptWrapped).split('\n');
-    const visibleStart = Math.max(0, this.model.scrollOffset);
-    const visibleLines = wrapped.slice(visibleStart, visibleStart + 12);
-    visibleLines.forEach((l: string) => lines.push('  ' + truncateToWidth(l, width - 4)));
-
-    if (wrapped.length > visibleStart + 12) {
-      lines.push(this.theme.fg('muted', `  ... (${wrapped.length - visibleStart - 12} more lines, ↓/↑ scroll)`));
-    }
-  }
-
-  private getTranscript(run: RunSnapshot): string {
-    if (run.summary) return run.summary;
-    if (run.taskPreviews && run.taskPreviews.length > 0) {
-      return run.taskPreviews.join('\n\n');
-    }
-    return 'No transcript available. Full details in persistence layer. Expanded mode works for parallel live updates via liveText and timers.';
+    return lines.map((line) => truncateToWidth(line, width));
   }
 
   invalidate(): void {
-    this.cachedLines = undefined;
-    this.cachedWidth = 0;
+    // Stateless rendering; method required by Component.
   }
 
-  onAction(listener: (action: UIAction) => void) {
-    this.emitter.on('action', listener);
-    return () => this.emitter.off('action', listener);
-  }
-
-  close() {
-    if (this.isDisposed) return;
-    this.isDisposed = true;
-    if (this.animationInterval) {
-      clearInterval(this.animationInterval);
-      this.animationInterval = undefined;
-    }
-    this.emitter.emit('action', { type: 'close' } as UIAction);
-    this.done();
+  close(): void {
+    if (this.disposed) return;
     this.dispose();
+    this.done();
   }
 
-  private dispose() {
-    this.emitter.removeAllListeners();
-    this.isDisposed = true;
+  dispose(): void {
+    this.disposed = true;
+    this.stopAnimation();
+    this.unsubscribe?.();
+    this.unsubscribe = undefined;
   }
-
-  wantsKeyRelease = false;
 }
 
-/** Helper to create the overlay (used by extension wiring). Returns handle proxy. */
-export function createSubagentsOverlay(
-  tui: TUI,
-  theme: Theme,
-  adapter: SubagentAdapter,
-  done: (result?: any) => void
-): SubagentsOverlay {
+export function createSubagentsOverlay(tui: TUI, theme: Theme, adapter: SubagentAdapter, done: () => void): SubagentsOverlay {
   return new SubagentsOverlay(tui, theme, done, adapter);
 }
 
-/** Test-friendly pure model for UI state */
+/** Small pure model retained for regression tests. */
 export class SubagentsUIModel {
-  private adapter: SubagentAdapter;
-  public state: SubagentsModel = { listMode: true, selectedIndex: 0, scrollOffset: 0, expanded: false };
-
-  constructor(adapter: SubagentAdapter) {
-    this.adapter = adapter;
-  }
-
-  get runs() { return this.adapter.getActiveRuns().concat(this.adapter.getCompletedRuns()); }
-
-  select(index: number) {
-    this.state.selectedIndex = Math.max(0, Math.min(index, this.runs.length - 1));
-  }
-
-  toggleExpanded() {
-    this.state.expanded = !this.state.expanded;
-  }
-
-  drillDown() {
-    if (this.runs.length > 0) {
-      this.state.listMode = false;
-      this.state.detailId = this.runs[this.state.selectedIndex]?.id;
-    }
-  }
-
-  goBack() {
-    this.state.listMode = true;
-    this.state.detailId = undefined;
-  }
-
+  state = { listMode: true, selectedIndex: 0, scrollOffset: 0, expanded: false, detailId: undefined as string | undefined };
+  constructor(private readonly adapter: SubagentAdapter) {}
+  get runs(): RunSnapshot[] { return [...this.adapter.getActiveRuns(), ...this.adapter.getCompletedRuns()]; }
+  select(index: number): void { this.state.selectedIndex = Math.max(0, Math.min(index, Math.max(0, this.runs.length - 1))); }
+  toggleExpanded(): void { this.state.expanded = !this.state.expanded; }
+  drillDown(): void { const run = this.runs[this.state.selectedIndex]; if (run) { this.state.listMode = false; this.state.detailId = run.id; } }
+  goBack(): void { this.state.listMode = true; this.state.detailId = undefined; }
   simulateKey(key: string): UIAction | null {
-    // Simulation for tests - returns action if triggered
-    if (key === 'Escape') return { type: 'close' };
-    if (key === 'Enter' && this.state.listMode) {
-      this.drillDown();
-      return { type: 'select', id: this.state.detailId };
-    }
-    if (key === 'c' && this.state.listMode) {
-      const run = this.runs[this.state.selectedIndex];
-      if (run) return { type: 'cancel', id: run.id };
-    }
+    if (key === "Escape") return { type: "close" };
+    if (key === "Enter") { this.drillDown(); return { type: "select", id: this.state.detailId }; }
+    if (key === "c") return { type: "cancel", id: this.runs[this.state.selectedIndex]?.id };
     return null;
   }
-
-  isRunning(): boolean {
-    return this.runs.some(r => r.state === 'running');
-  }
+  isRunning(): boolean { return this.runs.some((run) => ["queued", "running"].includes(run.state)); }
 }

@@ -10,7 +10,15 @@ export interface UsageStats {
   output: number;
   cacheRead: number;
   cacheWrite: number;
+  /** Reasoning is a subset of output when providers report it. */
+  reasoning?: number;
+  /** Provider-reported total cost. */
   cost: number;
+  costInput?: number;
+  costOutput?: number;
+  costCacheRead?: number;
+  costCacheWrite?: number;
+  /** Most recent turn's context size; not additive across turns. */
   contextTokens: number;
   turns: number;
 }
@@ -22,6 +30,7 @@ export interface TaskSpec {
   thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
   tools?: string[];
   profile: TaskProfile;
+  canWrite?: boolean;
   cwd?: string;
   timeoutMs: number;
   maxTurns?: number;
@@ -44,10 +53,15 @@ export interface TaskResult {
   stderr: string;
   usage: UsageStats;
   model?: string;
+  thinking?: TaskSpec["thinking"];
+  profile?: TaskProfile;
+  canWrite?: boolean;
   stopReason?: string;
   errorMessage?: string;
   index?: number;
   outputFile?: string;
+  outputMode?: OutputMode;
+  worktree?: { cwd: string; branch: string; baseCommit: string; changed: boolean; diffSummary?: string };
   sessionId?: string;
   startedAt?: number;
   endedAt?: number;
@@ -81,9 +95,15 @@ export interface RunSnapshot {
     errorMessage?: string;
     usage: UsageStats;
     model?: string;
+    thinking?: TaskSpec["thinking"];
+    profile?: TaskProfile;
+    canWrite?: boolean;
     outputFile?: string;
+    outputMode?: OutputMode;
+    worktree?: { cwd: string; branch: string; baseCommit: string; changed: boolean; diffSummary?: string };
     sessionId?: string;
     finalOutput?: string;
+    transcript?: string;
   }>;
 }
 
@@ -93,5 +113,16 @@ export interface ToolDetails {
 }
 
 export const emptyUsage = (): UsageStats => ({
-  input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0,
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  reasoning: 0,
+  cost: 0,
+  costInput: 0,
+  costOutput: 0,
+  costCacheRead: 0,
+  costCacheWrite: 0,
+  contextTokens: 0,
+  turns: 0,
 });

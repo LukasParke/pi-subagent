@@ -10,7 +10,7 @@
     "url": "https://github.com/LukasParke/pi-subagent.git"
   },
   "keywords": ["pi-package", "pi-coding-agent", "subagent", "agents", "coding-agent"],
-  "files": ["extensions", "src", "README.md", "LICENSE"],
+  "files": ["extensions", "src", "docs", "README.md", "LICENSE"],
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

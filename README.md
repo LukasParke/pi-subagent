@@ -4,7 +4,7 @@ Production-grade isolated subagents for [Pi](https://github.com/badlogic/pi-mono
 
 Delegate research, parallel exploration, and clean-context review to child Pi
 processes with cancellable background runs, session resume, worktree isolation,
-capability profiles, and a TUI inspector.
+capability profiles, a root/subagent/combined cost ledger, and a TUI inspector.
 
 ## Install
 
@@ -75,6 +75,7 @@ Parallel write-capable tasks sharing one checkout are rejected unless each uses
    artifacts and `~/.pi/subagent-sessions`.
 6. Status is compact; wait is the one-shot deliverable.
 7. On parent session shutdown, live children are aborted and awaited briefly.
+8. Provider-reported usage is counted once per root message and terminal child run.
 
 ## Layout
 
@@ -89,8 +90,9 @@ src/
   protocol.ts      # Pi JSON mode parser
   semaphore.ts     # concurrency limit
   registry.ts      # session-scoped run state
-  persistence.ts   # parent-session snapshots
-  output.ts        # global output caps
+  persistence.ts   # parent-session event folding
+  usage.ts         # root/subagent/combined usage ledger
+  output.ts        # exact global output caps
   format.ts / ui.ts# renderers + /subagents overlay
 ```
 
@@ -104,6 +106,12 @@ npm run pack:check
 ```
 
 Tests use a deterministic `fake-pi` child. No live model calls are required.
+
+## Cost accounting
+
+`status`, the footer, and `/subagents` show separate **root**, **subagent**, and
+**combined** totals based on provider-reported usage. Delivery and replay do not
+double count runs. See [docs/COST-ACCOUNTING.md](./docs/COST-ACCOUNTING.md).
 
 ## Security
 

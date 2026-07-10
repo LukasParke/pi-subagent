@@ -124,4 +124,23 @@ describe("ChildRunner", () => {
     expect(result.stderr).toMatch(/stderr/i);
     expect(result.state).toBe("failed");
   });
+
+  it("fails a complete protocol that exits nonzero", async () => {
+    process.env.FAKE_PI_MODE = "nonzero-complete";
+    const result = await runner.run(defaultSpec);
+    expect(result).toMatchObject({ state: "failed", stopReason: "nonzero_exit", exitCode: 1 });
+  });
+
+  it("fails provider error stop reasons even with exit zero", async () => {
+    process.env.FAKE_PI_MODE = "provider-error";
+    const result = await runner.run(defaultSpec);
+    expect(result).toMatchObject({ state: "failed", stopReason: "error", errorMessage: "provider failed" });
+  });
+
+  it("parses an unterminated final JSON line", async () => {
+    process.env.FAKE_PI_MODE = "unterminated";
+    const result = await runner.run(defaultSpec);
+    expect(result.state).toBe("completed");
+    expect(result.protocol.agentEndSeen).toBe(true);
+  });
 });

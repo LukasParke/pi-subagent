@@ -1,73 +1,60 @@
-import { describe, it, expect } from 'vitest';
-import { ProtocolParser } from '../src/protocol.js';
+import { describe, expect, it } from "vitest";
+import { ProtocolParser } from "../src/protocol.js";
 
-describe('ProtocolParser', () => {
-  it('parses success with session header, multiple text parts, message_end, agent_end', () => {
+const header = { type: "session", id: "session-1" };
+const message = {
+  type: "message_end",
+  message: {
+    role: "assistant", content: [{ type: "text", text: "hello" }, { type: "text", text: " world" }],
+    provider: "p", api: "x", model: "m", stopReason: "stop", timestamp: 1,
+    usage: { input: 10, output: 5, cacheRead: 2, cacheWrite: 1, reasoning: 3, totalTokens: 15, cost: { input: .01, output: .02, cacheRead: .001, cacheWrite: .002, total: .033 } },
+  },
+};
+const end = { type: "agent_end", messages: [] };
+
+describe("ProtocolParser", () => {
+  it("emits every update from a batched chunk", () => {
     const parser = new ProtocolParser();
-    const updates = [];
-
-    updates.push(parser.feed('{"type":"session","id":"s123"}\n'));
-    updates.push(parser.feed('{"type":"message_update","message":{"role":"assistant","content":[{"type":"text","text":"Hello "}]}}\n'));
-    updates.push(parser.feed('{"type":"message_update","message":{"role":"assistant","content":[{"type":"text","text":"world!"}]}}\n'));
-    updates.push(parser.feed('{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Hello world!"}],"usage":{"input":20,"output":10,"cost":{"total":0.002},"totalTokens":30,"stopReason":"stop"}}}\n'));
-    updates.push(parser.feed('{"type":"agent_end"}\n'));
-
-    const final = parser.finalize(0);
-
-    expect(final.protocol.headerSeen).toBe(true);
-    expect(final.protocol.assistantEndSeen).toBe(true);
-    expect(final.protocol.agentEndSeen).toBe(true);
-    expect(final.liveText).toBe('Hello world!');
-    expect(final.usage.turns).toBe(1);
-    expect(final.usage.cost).toBe(0.002);
-    expect(final.stopReason).toBe('stop');
-    expect(final.sessionId).toBe('s123');
-    expect(final.messages.length).toBe(1);
-    expect(final.state).toBe('completed');
+    const updates = parser.feed([header, { type: "message_update", message: { role: "assistant", content: [] }, assistantMessageEvent: { type: "text_delta", delta: "hi" } }, message, end].map((value) => JSON.stringify(value)).join("\n") + "\n");
+    expect(updates.map((u) => u.type)).toEqual(["session", "live-text", "message", "agent-end"]);
   });
 
-  it('handles multiple text parts concatenated', () => {
+  it("flushes a final unterminated JSON line", () => {
     const parser = new ProtocolParser();
-    parser.feed('{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Part1"},{"type":"text","text":" Part2"}]}}\n');
-    const final = parser.finalize(0);
-    expect(final.liveText).toBe('Part1  Part2');
+    parser.feed(JSON.stringify(header) + "\n" + JSON.stringify(message) + "\n" + JSON.stringify(end));
+    const result = parser.finalize(0);
+    expect(result.state).toBe("completed");
+    expect(result.protocol.agentEndSeen).toBe(true);
+    expect(result.liveText).toBe("hello world");
   });
 
-  it('counts malformed lines but continues', () => {
-    const parser = new ProtocolParser();
-    parser.feed('not json\n');
-    parser.feed('{"type":"session","id":"s456"}\n');
-    parser.feed('invalid json {\n');
-    parser.feed('{"type":"agent_end"}\n');
-
-    const final = parser.finalize(0);
-    expect(final.protocol.parseErrors).toBe(2);
-    expect(final.protocol.validEvents).toBe(2);
-    expect(final.protocol.headerSeen).toBe(true);
-    expect(final.state).toBe('failed'); // no assistant end
+  it("requires header, assistant message, agent_end and exit zero", () => {
+    const variants = [
+      [message, end],
+      [header, end],
+      [header, message],
+    ];
+    for (const events of variants) {
+      const parser = new ProtocolParser();
+      parser.feed(events.map((value) => JSON.stringify(value)).join("\n") + "\n");
+      expect(parser.finalize(0).state).toBe("failed");
+    }
+    const nonzero = new ProtocolParser();
+    nonzero.feed([header, message, end].map((value) => JSON.stringify(value)).join("\n") + "\n");
+    expect(nonzero.finalize(1)).toMatchObject({ state: "failed", stopReason: "nonzero_exit" });
   });
 
-  it('treats exit 0 without header+assistantEnd as protocol failure', () => {
+  it("classifies unexpected signals as failure", () => {
     const parser = new ProtocolParser();
-    parser.feed('{"type":"agent_end"}\n'); // no session or message_end
-
-    const final = parser.finalize(0);
-    expect(final.protocol.headerSeen).toBe(false);
-    expect(final.protocol.assistantEndSeen).toBe(false);
-    expect(final.state).toBe('failed');
-    expect(final.exitCode).toBe(1); // changed from 0
-    expect(final.stopReason).toBe('protocol_error');
+    parser.feed([header, message, end].map((value) => JSON.stringify(value)).join("\n") + "\n");
+    expect(parser.finalize(null, "SIGTERM")).toMatchObject({ state: "failed", stopReason: "unexpected_signal" });
   });
 
-  it('captures usage and model/stopReason from message_end', () => {
+  it("captures full provider cost categories and malformed count", () => {
     const parser = new ProtocolParser();
-    parser.feed('{"type":"session","id":"u789"}\n');
-    parser.feed('{"type":"message_end","message":{"role":"assistant","model":"claude-4","content":[{"type":"text","text":"Done"}],"usage":{"input":100,"output":50,"cost":{"total":0.05},"totalTokens":150,"stopReason":"max_tokens"}}}\n');
-
-    const final = parser.finalize(0);
-    expect(final.model).toBe('claude-4');
-    expect(final.stopReason).toBe('stop');
-    expect(final.usage.input).toBe(100);
-    expect(final.usage.output).toBe(50);
+    parser.feed(`bad json\n${JSON.stringify(header)}\n${JSON.stringify(message)}\n${JSON.stringify(end)}\n`);
+    const result = parser.finalize(0);
+    expect(result.protocol.parseErrors).toBe(1);
+    expect(result.usage).toMatchObject({ cost: .033, costInput: .01, costOutput: .02, reasoning: 3, turns: 1 });
   });
 });

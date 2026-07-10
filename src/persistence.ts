@@ -1,12 +1,50 @@
-import type { RunSnapshot, RunState, RunMode } from './types.js';
-import type { SubagentConfig } from './config.js';
+import { Buffer } from "node:buffer";
+import type { SubagentConfig } from "./config.js";
+import type { RunMode, RunSnapshot, RunState, TaskProfile, UsageStats } from "./types.js";
+import { emptyUsage } from "./types.js";
+
+export const RUN_ENTRY_TYPE = "subagent-run-v1";
 
 export interface PersistenceAdapter {
-  /** Usable by Pi appendEntry; no extension API imports needed here. */
+  /** Append to the currently-owned parent session. Implementations must reject stale ownership. */
   appendEntry(type: string, payload: unknown): void;
-  /** Returns all session entries for rebuild (e.g. from ctx.sessionManager.getEntries()). */
+  /** Active-branch entries only, in branch order. */
   getEntries(): Array<{ type?: string; customType?: string; data?: unknown; timestamp?: number }>;
-  getActiveBranch?(): string | undefined;
+}
+
+export interface PersistedResult {
+  label: string;
+  task: string;
+  state: RunState;
+  exitCode: number | null;
+  stopReason?: string;
+  errorMessage?: string;
+  usage: UsageStats;
+  model?: string;
+  thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  profile?: TaskProfile;
+  canWrite?: boolean;
+  outputFile?: string;
+  outputMode?: "inline" | "file-only";
+  worktree?: { cwd: string; branch: string; baseCommit: string; changed: boolean; diffSummary?: string };
+  sessionId?: string;
+  finalOutput?: string;
+  transcript?: string;
+}
+
+export interface PersistenceEventData {
+  mode?: RunMode;
+  state?: RunState;
+  startedAt?: number;
+  endedAt?: number;
+  taskPreviews?: string[];
+  summary?: string;
+  delivered?: boolean;
+  results?: PersistedResult[];
+  resultIndex?: number;
+  childSessionId?: string;
+  progress?: string;
+  turn?: number;
 }
 
 export interface PersistenceEvent {
@@ -14,193 +52,207 @@ export interface PersistenceEvent {
   id: string;
   sessionKey: string;
   timestamp: number;
-  type: 'start' | 'checkpoint' | 'terminal' | 'delivered' | 'dismissed';
-  branch?: string;
-  data: {
-    mode?: RunMode;
-    state?: RunState;
-    startedAt?: number;
-    endedAt?: number;
-    taskPreviews?: string[];
-    summary?: string;
-    delivered?: boolean;
-    results?: Array<{
-      label: string;
-      task: string;
-      state: RunState;
-      exitCode: number | null;
-      stopReason?: string;
-      errorMessage?: string;
-      usage: any;
-      model?: string;
-      outputFile?: string;
-      sessionId?: string;
-      finalOutput?: string;
-    }>;
-    childSessionId?: string;
-    progress?: string;
-    turn?: number;
-    [key: string]: unknown;
+  sequence: number;
+  type: "start" | "checkpoint" | "terminal" | "delivered" | "dismissed";
+  data: PersistenceEventData;
+}
+
+function isRunState(value: unknown): value is RunState {
+  return ["queued", "running", "completed", "partial", "failed", "cancelled", "lost"].includes(
+    String(value),
+  );
+}
+
+function isRunMode(value: unknown): value is RunMode {
+  return value === "single" || value === "parallel";
+}
+
+function normalizeUsage(value: unknown): UsageStats {
+  if (!value || typeof value !== "object") return emptyUsage();
+  const input = value as Partial<UsageStats>;
+  const finite = (n: unknown) => (typeof n === "number" && Number.isFinite(n) && n >= 0 ? n : 0);
+  return {
+    input: finite(input.input),
+    output: finite(input.output),
+    cacheRead: finite(input.cacheRead),
+    cacheWrite: finite(input.cacheWrite),
+    reasoning: finite(input.reasoning),
+    cost: finite(input.cost),
+    costInput: finite(input.costInput),
+    costOutput: finite(input.costOutput),
+    costCacheRead: finite(input.costCacheRead),
+    costCacheWrite: finite(input.costCacheWrite),
+    contextTokens: finite(input.contextTokens),
+    turns: finite(input.turns),
   };
 }
 
-/** Branch-aware persistence. Rebuilds latest state per-id from active branch only. Latest schema v1 wins. Running records restored as 'lost'. Malformed skipped. */
-export class PersistenceLayer {
-  constructor(
-    private adapter: PersistenceAdapter,
-    private config: SubagentConfig,
-  ) {}
+function utf8Prefix(value: string, maxBytes: number): string {
+  const buffer = Buffer.from(value, "utf8");
+  if (buffer.length <= maxBytes) return value;
+  let end = maxBytes;
+  while (end > 0 && (buffer[end] & 0xc0) === 0x80) end--;
+  return buffer.subarray(0, end).toString("utf8");
+}
 
-  private getCurrentBranch(): string | undefined {
-    return this.adapter.getActiveBranch?.();
+function normalizeResult(value: unknown): PersistedResult | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const r = value as Partial<PersistedResult>;
+  if (typeof r.label !== "string" || typeof r.task !== "string") return undefined;
+  return {
+    label: r.label,
+    task: r.task,
+    state: isRunState(r.state) ? r.state : "running",
+    exitCode: typeof r.exitCode === "number" || r.exitCode === null ? r.exitCode : null,
+    stopReason: typeof r.stopReason === "string" ? r.stopReason : undefined,
+    errorMessage: typeof r.errorMessage === "string" ? utf8Prefix(r.errorMessage, 2_000) : undefined,
+    usage: normalizeUsage(r.usage),
+    model: typeof r.model === "string" ? r.model : undefined,
+    thinking: ["off", "minimal", "low", "medium", "high", "xhigh"].includes(String(r.thinking)) ? r.thinking : undefined,
+    profile: ["explore", "review", "general"].includes(String(r.profile)) ? r.profile : undefined,
+    canWrite: typeof r.canWrite === "boolean" ? r.canWrite : undefined,
+    outputFile: typeof r.outputFile === "string" ? r.outputFile : undefined,
+    outputMode: r.outputMode === "file-only" ? "file-only" : r.outputMode === "inline" ? "inline" : undefined,
+    worktree:
+      r.worktree &&
+      typeof r.worktree.cwd === "string" &&
+      typeof r.worktree.branch === "string" &&
+      typeof r.worktree.baseCommit === "string"
+        ? { ...r.worktree, changed: r.worktree.changed === true }
+        : undefined,
+    sessionId: typeof r.sessionId === "string" ? r.sessionId : undefined,
+    finalOutput: typeof r.finalOutput === "string" ? utf8Prefix(r.finalOutput, 16_384) : undefined,
+    transcript: typeof r.transcript === "string" ? utf8Prefix(r.transcript, 32_768) : undefined,
+  };
+}
+
+function unwrapEvent(entry: { type?: string; customType?: string; data?: unknown }): PersistenceEvent | undefined {
+  if (entry.customType !== RUN_ENTRY_TYPE && entry.type !== RUN_ENTRY_TYPE) return undefined;
+  const raw = entry.data as Partial<PersistenceEvent> | undefined;
+  if (!raw || raw.schemaVersion !== 1 || typeof raw.id !== "string" || typeof raw.sessionKey !== "string") {
+    return undefined;
+  }
+  if (!["start", "checkpoint", "terminal", "delivered", "dismissed"].includes(String(raw.type))) {
+    return undefined;
+  }
+  return {
+    schemaVersion: 1,
+    id: raw.id,
+    sessionKey: raw.sessionKey,
+    timestamp: typeof raw.timestamp === "number" ? raw.timestamp : 0,
+    sequence: typeof raw.sequence === "number" ? raw.sequence : 0,
+    type: raw.type as PersistenceEvent["type"],
+    data: raw.data && typeof raw.data === "object" ? raw.data : {},
+  };
+}
+
+/**
+ * Versioned event persistence. Restoration folds every event on the active branch,
+ * rather than treating the latest delta as a complete snapshot.
+ */
+export class PersistenceLayer {
+  private sequence = 0;
+
+  constructor(
+    private readonly adapter: PersistenceAdapter,
+    private readonly config: SubagentConfig,
+  ) {
+    for (const entry of adapter.getEntries()) {
+      const event = unwrapEvent(entry);
+      if (event) this.sequence = Math.max(this.sequence, event.sequence);
+    }
   }
 
-  /** Persist a start, checkpoint (child-session-id, throttled progress/turn), or terminal state. */
   persist(
     id: string,
     sessionKey: string,
-    type: PersistenceEvent['type'],
-    data: PersistenceEvent['data'],
-    isTerminal = false,
+    type: PersistenceEvent["type"],
+    data: PersistenceEventData,
+    _terminalHint?: boolean,
   ): void {
-    if (!sessionKey) return; // Never persist into a new/unknown session.
-
+    if (!id || !sessionKey) return;
     const event: PersistenceEvent = {
       schemaVersion: 1,
       id,
       sessionKey,
       timestamp: Date.now(),
+      sequence: ++this.sequence,
       type,
-      branch: this.getCurrentBranch(),
-      data: {
-        ...data,
-        // Throttle implicit by caller; terminal always persisted
-      },
+      data,
     };
-
-    this.adapter.appendEntry('subagent-run-v1', event);
+    this.adapter.appendEntry(RUN_ENTRY_TYPE, event);
   }
 
-  /** Rebuild runtime state from entries. Only active branch, latest per id, validate, running->lost. */
+  /** Fold active-branch events in their session order. */
   rebuild(sessionKey: string): Map<string, RunSnapshot> {
-    const entries = this.adapter
-      .getEntries()
-      .filter((e: any) => {
-        const payload = (e.data || e) as any;
-        const effectivePayload = payload || e;
-        return (
-          (e.type === 'subagent-run-v1' || e.customType === 'subagent-run-v1' || effectivePayload?.type === 'subagent-run-v1' || effectivePayload?.schemaVersion === 1) &&
-          effectivePayload?.schemaVersion === 1 &&
-          effectivePayload?.sessionKey === sessionKey
-        );
-      });
-
-    const byId = new Map<string, PersistenceEvent[]>();
-
-    for (const entry of entries) {
-      const payload = (entry.data || entry) as any;
-      const ev: PersistenceEvent = {
-        schemaVersion: 1,
-        id: payload.id,
-        sessionKey: payload.sessionKey || sessionKey,
-        timestamp: payload.timestamp || Date.now(),
-        type: (payload.type || 'terminal') as any,
-        branch: payload.branch,
-        data: payload.data || payload,
-      };
-      if (!ev.id || !ev.sessionKey) continue; // malformed
-
-      const branch = ev.branch || this.getCurrentBranch();
-      if (this.getCurrentBranch() && branch !== this.getCurrentBranch()) continue; // branch-aware: active only
-
-      if (!byId.has(ev.id)) byId.set(ev.id, []);
-      byId.get(ev.id)!.push(ev);
-    }
-
     const snapshots = new Map<string, RunSnapshot>();
 
-    for (const [id, events] of byId.entries()) {
-      // Latest wins
-      events.sort((a, b) => b.timestamp - a.timestamp);
-      const latest = events[0]!;
+    for (const entry of this.adapter.getEntries()) {
+      const event = unwrapEvent(entry);
+      if (!event || event.sessionKey !== sessionKey) continue;
 
-      let snapshot = this.snapshotFromEvent(latest, id, sessionKey);
-
-      // Validate
-      if (!this.isValidSnapshot(snapshot)) {
-        continue; // skip malformed
-      }
-
-      // Running records restore as lost (process died with parent)
-      if (snapshot.state === 'running' || snapshot.state === 'queued') {
+      let snapshot = snapshots.get(event.id);
+      if (!snapshot) {
         snapshot = {
-          ...snapshot,
-          state: 'lost' as RunState,
-          endedAt: Date.now(),
-          summary: snapshot.summary || 'Run was lost across restart (child process terminated).',
+          schemaVersion: 1,
+          id: event.id,
+          sessionKey,
+          mode: "single",
+          state: "running",
+          startedAt: event.timestamp || Date.now(),
+          taskPreviews: [],
+          delivered: false,
+          results: [],
         };
       }
 
-      snapshots.set(id, snapshot);
+      const d = event.data;
+      if (isRunMode(d.mode)) snapshot.mode = d.mode;
+      if (isRunState(d.state)) snapshot.state = d.state;
+      if (typeof d.startedAt === "number") snapshot.startedAt = d.startedAt;
+      if (typeof d.endedAt === "number") snapshot.endedAt = d.endedAt;
+      if (Array.isArray(d.taskPreviews) && d.taskPreviews.every((x) => typeof x === "string")) {
+        snapshot.taskPreviews = [...d.taskPreviews];
+      }
+      if (typeof d.summary === "string") snapshot.summary = d.summary;
+      if (typeof d.delivered === "boolean") snapshot.delivered = d.delivered;
+      if (Array.isArray(d.results)) {
+        snapshot.results = d.results.map(normalizeResult).filter((r): r is PersistedResult => !!r);
+      }
+
+      if (event.type === "checkpoint" && typeof d.childSessionId === "string") {
+        const index = typeof d.resultIndex === "number" ? d.resultIndex : 0;
+        const result = snapshot.results[index];
+        if (result) result.sessionId = d.childSessionId;
+      }
+      if (event.type === "delivered" || event.type === "dismissed") snapshot.delivered = true;
+
+      snapshots.set(event.id, snapshot);
+    }
+
+    for (const [id, snapshot] of snapshots) {
+      if (snapshot.state === "running" || snapshot.state === "queued") {
+        snapshots.set(id, {
+          ...snapshot,
+          state: "lost",
+          endedAt: Date.now(),
+          summary: snapshot.summary || "Run was interrupted before the parent session completed.",
+        });
+      }
     }
 
     return snapshots;
   }
 
-  private snapshotFromEvent(ev: PersistenceEvent, id: string, sessionKey: string): RunSnapshot {
-    const d = ev.data;
-    return {
-      schemaVersion: 1,
-      id,
-      sessionKey,
-      mode: (d.mode as RunMode) || 'single',
-      state: (d.state as RunState) || 'completed',
-      startedAt: d.startedAt || ev.timestamp,
-      endedAt: d.endedAt,
-      taskPreviews: d.taskPreviews || [],
-      summary: d.summary,
-      delivered: d.delivered || false,
-      results: (d.results || []).map((r: any) => ({
-        label: r.label || '',
-        task: r.task || '',
-        state: r.state || 'completed',
-        exitCode: r.exitCode ?? null,
-        stopReason: r.stopReason,
-        errorMessage: r.errorMessage,
-        usage: r.usage || { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-        model: r.model,
-        outputFile: r.outputFile,
-        sessionId: r.sessionId,
-        finalOutput: r.finalOutput?.slice(0, 4096),
-      })),
-    };
-  }
-
-  private isValidSnapshot(s: RunSnapshot): boolean {
-    return (
-      typeof s.id === 'string' &&
-      typeof s.sessionKey === 'string' &&
-      ['single', 'parallel'].includes(s.mode) &&
-      s.taskPreviews.every((p) => typeof p === 'string')
-    );
-  }
-
-  /** Mark delivered (compact in-memory history). */
   markDelivered(id: string, sessionKey: string): void {
-    this.persist(id, sessionKey, 'delivered', { delivered: true });
+    this.persist(id, sessionKey, "delivered", { delivered: true });
   }
 
-  /** Cleanup planner: no destructive default. Only if retention configured, emit referenced IDs and candidates. */
+  /** Non-destructive planner. Filesystem scanning/deletion is intentionally outside persistence. */
   planRetention(referencedSessionIds: Set<string>): { keep: string[]; candidates: string[] } {
-    if (typeof this.config.sessionRetentionDays !== 'number' || this.config.sessionRetentionDays <= 0) {
-      return { keep: [], candidates: [] }; // no destructive 7-day default
+    if (!this.config.sessionRetentionDays || this.config.sessionRetentionDays <= 0) {
+      return { keep: Array.from(referencedSessionIds), candidates: [] };
     }
-
-    // In real impl would scan FS or index, but here just placeholder per spec: produce candidates only when configured.
-    // Do not perform FS deletion.
-    return {
-      keep: Array.from(referencedSessionIds),
-      candidates: [], // would compute stale non-referenced here
-    };
+    return { keep: Array.from(referencedSessionIds), candidates: [] };
   }
 }
