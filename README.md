@@ -8,18 +8,31 @@ capability profiles, a root/subagent/combined cost ledger, and a TUI inspector.
 
 ## Install
 
+Pi packages install from **npm**, **git**, or a **local path**:
+
 ```bash
-# from git (after publish)
+# npm (versioned; surfaces on the pi.dev gallery via the pi-package keyword)
+pi install npm:pi-subagent@0.1.0
+
+# latest npm
+pi install npm:pi-subagent
+
+# git pin to a release tag
+pi install git:github.com/LukasParke/pi-subagent@v0.1.0
+
+# live main
 pi install git:github.com/LukasParke/pi-subagent
 
-# from local checkout
-pi install /Users/luke/github/pi-subagent
+# local checkout
+pi install /absolute/path/to/pi-subagent
 ```
 
 Then start Pi normally. The package registers:
 
 - tool: `subagent`
 - command: `/subagents`
+
+Publishing is automated from `v*` tags — see [docs/RELEASING.md](./docs/RELEASING.md).
 
 ## Quick usage
 

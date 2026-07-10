@@ -1,0 +1,136 @@
+# Publish a Pi package release.
+#
+# Pi installs packages via either:
+#   pi install npm:pi-subagent@0.1.0
+#   pi install git:github.com/LukasParke/pi-subagent@v0.1.0
+#
+# Trigger:
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# npm auth (one of):
+#   1) Trusted Publishing on npmjs.com → this repo as GitHub Actions publisher
+#      (preferred: enables --provenance with id-token, no long-lived token)
+#   2) Repository secret NPM_TOKEN = npm automation/granular publish token
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm run check
+      - run: npm run pack:check
+
+      - name: Verify tag matches package.json version
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p "require('./package.json').version")"
+          echo "tag_version=${TAG}"
+          echo "package_version=${PKG}"
+          if [ "${TAG}" != "${PKG}" ]; then
+            echo "::error::Tag v${TAG} does not match package.json version ${PKG}."
+            echo "Bump package.json version, commit, then retag."
+            exit 1
+          fi
+
+  publish:
+    name: publish
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - run: npm ci
+
+      - name: Build npm pack artifact
+        id: pack
+        run: |
+          set -euo pipefail
+          TGZ="$(npm pack --pack-destination "${RUNNER_TEMP}" | tail -n1)"
+          echo "tgz=${RUNNER_TEMP}/${TGZ}" >> "${GITHUB_OUTPUT}"
+          echo "filename=${TGZ}" >> "${GITHUB_OUTPUT}"
+          ls -la "${RUNNER_TEMP}/${TGZ}"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          NOTES="$(cat <<EOF
+          ## pi-subagent ${VERSION}
+
+          Production-grade isolated subagents for [Pi](https://pi.dev).
+
+          ### Install with Pi
+
+          \`\`\`bash
+          # npm (also listed on the pi.dev package gallery via the pi-package keyword)
+          pi install npm:pi-subagent@${VERSION}
+
+          # git pin (this release tag)
+          pi install git:github.com/LukasParke/pi-subagent@${TAG}
+          \`\`\`
+
+          After install, Pi registers:
+
+          - tool: \`subagent\`
+          - command: \`/subagents\`
+
+          See [README](https://github.com/LukasParke/pi-subagent#readme) and [docs/COST-ACCOUNTING.md](https://github.com/LukasParke/pi-subagent/blob/main/docs/COST-ACCOUNTING.md).
+          EOF
+          )"
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; uploading asset if needed."
+            gh release upload "${TAG}" "${{ steps.pack.outputs.tgz }}" --clobber
+          else
+            gh release create "${TAG}" \
+              --title "pi-subagent ${VERSION}" \
+              --notes "${NOTES}" \
+              "${{ steps.pack.outputs.tgz }}"
+          fi
+
+      - name: Publish to npm
+        env:
+          # Optional fallback when Trusted Publishing is not configured.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Preferred: npm Trusted Publishing for this repo + workflow (OIDC).
+          # Fallback: repository secret NPM_TOKEN (Automation/granular publish token).
+          if [ -n "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "Using repository secret NPM_TOKEN for npm auth."
+          else
+            echo "NPM_TOKEN not set; authenticating via npm Trusted Publishing (OIDC)."
+          fi
+
+          npm publish --access public --provenance --ignore-scripts

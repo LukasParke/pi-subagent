@@ -5,18 +5,35 @@
   "type": "module",
   "license": "MIT",
   "author": "Luke Parke",
+  "homepage": "https://github.com/LukasParke/pi-subagent#readme",
+  "bugs": {
+    "url": "https://github.com/LukasParke/pi-subagent/issues"
+  },
   "repository": {
     "type": "git",
-    "url": "https://github.com/LukasParke/pi-subagent.git"
+    "url": "git+https://github.com/LukasParke/pi-subagent.git"
   },
-  "keywords": ["pi-package", "pi-coding-agent", "subagent", "agents", "coding-agent"],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "subagent",
+    "agents",
+    "coding-agent",
+    "extension"
+  ],
   "files": ["extensions", "src", "docs", "README.md", "LICENSE"],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "check": "npm run typecheck && npm test",
-    "pack:check": "npm pack --dry-run"
+    "pack:check": "npm pack --dry-run",
+    "release:check": "npm run check && npm run pack:check"
   },
   "pi": {
     "extensions": ["./extensions/subagent.ts"]
