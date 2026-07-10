@@ -1,6 +1,6 @@
 # Releasing
 
-Pi installs packages from **npm** or **git**. Publishing this package binds both:
+Pi installs packages from **npm** or **git**. Publishing binds both:
 
 | Source | Install command | Needs |
 |--------|-----------------|-------|
@@ -10,36 +10,64 @@ Pi installs packages from **npm** or **git**. Publishing this package binds both
 
 The [pi.dev package gallery](https://pi.dev/packages) lists npm packages that declare the `pi-package` keyword (already set in `package.json`).
 
-## One-time npm setup
+## One-time: npm Trusted Publishing
 
-Pick **one** auth method for the Release workflow:
+This repo’s [Release](../.github/workflows/release.yml) workflow is set up for
+[npm Trusted Publishing](https://docs.npmjs.com/trusted-publishers) (OIDC).
+No long-lived `NPM_TOKEN` is required or used.
 
-### Option A — Trusted Publishing (preferred)
+### 1. Ensure the package exists on npm
 
-1. Create the empty package once (first publish can also create it):
-   - Log into https://www.npmjs.com/
-   - Ensure the package name `pi-subagent` is available under your account
-2. On the package settings page, add a **Trusted Publisher**:
-   - Provider: GitHub Actions
-   - Repository: `LukasParke/pi-subagent`
-   - Workflow: `release.yml`
-   - Environment: leave empty unless you add one
-3. No long-lived `NPM_TOKEN` is required. The workflow already requests
-   `id-token: write` and runs `npm publish --provenance`.
+Trusted Publisher settings live under the **package** page. If `pi-subagent`
+does not exist yet:
 
-### Option B — Automation token
+- Claim / create the package name under your npm account (first manual publish
+  with 2FA is fine), **or**
+- If npm offers pre-registration for the name on your account, create it there.
 
-1. Create an npm **Automation** or granular access token with publish rights
-2. Add it as a repository secret:
-   ```bash
-   gh secret set NPM_TOKEN --repo LukasParke/pi-subagent
-   ```
-3. Re-run or push a new release tag
+Confirm: https://www.npmjs.com/package/pi-subagent (404 until first release).
+
+### 2. Add the trusted publisher
+
+On https://www.npmjs.com/package/pi-subagent → **Settings** → **Trusted Publisher**:
+
+| Field | Value |
+|-------|-------|
+| Provider | **GitHub Actions** |
+| Organization or user | `LukasParke` |
+| Repository | `pi-subagent` |
+| Workflow filename | `release.yml` |
+| Environment name | *(leave empty)* |
+| Allowed actions | **`npm publish`** (required) |
+
+Notes:
+
+- Workflow filename is **only** `release.yml` — not `.github/workflows/release.yml`
+- Values are case-sensitive
+- npm does **not** validate this form until you actually publish
+- Self-hosted runners are not supported (this workflow uses `ubuntu-latest`)
+
+### 3. Optional hardening (after first successful OIDC publish)
+
+Package → **Settings** → **Publishing access**:
+
+- Select **Require two-factor authentication and disallow tokens**
+
+This blocks classic tokens while Trusted Publishing continues to work.
+
+### 4. GitHub Actions token scope for Releases
+
+The workflow requests `contents: write` so it can create GitHub Releases.
+If release creation fails with a permissions error, set:
+
+**Repo → Settings → Actions → General → Workflow permissions → Read and write**
+
+(OIDC publish uses `id-token: write`, which does not need that toggle.)
 
 ## Cut a release
 
-1. Bump `version` in `package.json` (and commit).
-2. Ensure `main` is clean and CI is green:
+1. Bump `version` in `package.json` if needed and commit to `main`.
+2. Ensure CI is green:
    ```bash
    npm run release:check
    ```
@@ -49,11 +77,18 @@ Pick **one** auth method for the Release workflow:
    git tag "v${VERSION}"
    git push origin main "v${VERSION}"
    ```
-4. GitHub Actions [Release](../.github/workflows/release.yml) will:
+4. GitHub Actions **Release** will:
    - run typecheck + tests + pack dry-run
    - verify `vX.Y.Z` == `package.json` version
    - create a GitHub Release with the packed tarball
-   - publish to npm with provenance
+   - publish to npm via Trusted Publishing (automatic provenance)
+
+Watch the run:
+
+```bash
+gh run list --workflow release.yml --limit 3
+gh run watch
+```
 
 ## Install after publish
 
@@ -73,9 +108,21 @@ pi install git:github.com/LukasParke/pi-subagent
 
 Then start Pi. The package registers the `subagent` tool and `/subagents` command.
 
-## Notes
+## Troubleshooting Trusted Publishing
 
-- Package resources are declared via the `pi` key in `package.json` (`extensions/subagent.ts`).
-- Peer deps (`@earendil-works/pi-*`, `typebox`) are not bundled; Pi already provides them.
-- `files` includes `extensions/`, `src/`, and `docs/` so install and gallery consumers get the full package.
-- Prefer git tags for permanent pins in team settings; use unscoped `npm:pi-subagent` only when you intentionally want npm update semantics.
+| Symptom | Check |
+|---------|--------|
+| `ENEEDAUTH` / Unable to authenticate | Workflow filename is exactly `release.yml`; org/user/repo match; allowed action includes `npm publish` |
+| `ENEEDAUTH` after adding token secret | This workflow uses **OIDC only** and unsets `NODE_AUTH_TOKEN`. Remove blank secrets that might inject empty tokens |
+| Provenance missing | Public repo + public package + Trusted Publishing path |
+| GitHub Release fails | Workflow permissions need `contents: write` |
+| Tag rejected by version check | `v0.1.0` tag requires `"version": "0.1.0"` in `package.json` |
+| npm version too old | Workflow pins Node 24; step fails if npm < 11.5.1 |
+
+## Package contract (Pi)
+
+- `keywords` includes `pi-package` for gallery listing
+- `pi.extensions` points at `./extensions/subagent.ts`
+- Peer deps (`@earendil-works/pi-*`, `typebox`) are **not** bundled; Pi provides them
+- `files` includes `extensions/`, `src/`, and `docs/`
+- `repository.url` is `git+https://github.com/LukasParke/pi-subagent.git` (must match origin)

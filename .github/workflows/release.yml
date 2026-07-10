@@ -1,16 +1,24 @@
-# Publish a Pi package release.
+# Publish a Pi package release for:
+#   pi install npm:pi-subagent@X.Y.Z
+#   pi install git:github.com/LukasParke/pi-subagent@vX.Y.Z
 #
-# Pi installs packages via either:
-#   pi install npm:pi-subagent@0.1.0
-#   pi install git:github.com/LukasParke/pi-subagent@v0.1.0
+# Auth: npm Trusted Publishing (OIDC). Configure on npmjs.com:
+#   Organization/user: LukasParke
+#   Repository:        pi-subagent
+#   Workflow filename: release.yml   ← filename only, not the path
+#   Environment:       (leave empty)
+#   Allowed actions:   npm publish
+#
+# Requirements (npm docs):
+#   - Node >= 22.14.0  (this workflow uses 24)
+#   - npm CLI >= 11.5.1 (ships with Node 24 runners)
+#   - permissions.id-token: write
+#   - package.json repository.url matches this GitHub repo
+#   - public repository + public package (for provenance)
 #
 # Trigger:
-#   git tag v0.1.0 && git push origin v0.1.0
-#
-# npm auth (one of):
-#   1) Trusted Publishing on npmjs.com → this repo as GitHub Actions publisher
-#      (preferred: enables --provenance with id-token, no long-lived token)
-#   2) Repository secret NPM_TOKEN = npm automation/granular publish token
+#   git tag vX.Y.Z && git push origin vX.Y.Z
+#   (tag without leading v must equal package.json version)
 name: Release
 
 on:
@@ -22,6 +30,11 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+# Workflow-level defaults. Job can still restate for clarity.
+permissions:
+  contents: write # GitHub Release + asset upload
+  id-token: write # npm Trusted Publishing OIDC + provenance
+
 jobs:
   check:
     name: check
@@ -31,7 +44,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
 
       - run: npm ci
@@ -61,13 +74,48 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Do not enable package-manager cache on release builds (npm trusted-publish guidance).
+      # Do not pass a blank NODE_AUTH_TOKEN here — empty tokens break OIDC auth fallback.
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-          cache: npm
+          node-version: 24
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false
 
-      - run: npm ci
+      - name: Install production-adjacent deps
+        run: npm ci
+
+      - name: Verify npm tooling for Trusted Publishing
+        run: |
+          set -euo pipefail
+          node -v
+          npm -v
+          # Trusted Publishing requires npm >= 11.5.1
+          node -e '
+            const [maj, min, pat] = process.versions.npm
+              ? process.versions.npm.split(".").map(Number)
+              : require("child_process").execSync("npm -v", { encoding: "utf8" }).trim().split(".").map(Number);
+            const ok = maj > 11 || (maj === 11 && (min > 5 || (min === 5 && pat >= 1)));
+            if (!ok) {
+              console.error("npm CLI must be >= 11.5.1 for Trusted Publishing, got", process.versions.npm || "unknown");
+              process.exit(1);
+            }
+            console.log("npm CLI ok for Trusted Publishing");
+          '
+
+      - name: Verify package repository points at this GitHub repo
+        run: |
+          set -euo pipefail
+          node -e '
+            const pkg = require("./package.json");
+            const url = pkg.repository?.url || "";
+            const expected = "github.com/LukasParke/pi-subagent";
+            if (!String(url).includes(expected)) {
+              console.error("package.json repository.url must match", expected, "got", url);
+              process.exit(1);
+            }
+            console.log("repository.url ok:", url);
+          '
 
       - name: Build npm pack artifact
         id: pack
@@ -93,7 +141,7 @@ jobs:
           ### Install with Pi
 
           \`\`\`bash
-          # npm (also listed on the pi.dev package gallery via the pi-package keyword)
+          # npm (surfaces on pi.dev gallery via the pi-package keyword)
           pi install npm:pi-subagent@${VERSION}
 
           # git pin (this release tag)
@@ -105,7 +153,7 @@ jobs:
           - tool: \`subagent\`
           - command: \`/subagents\`
 
-          See [README](https://github.com/LukasParke/pi-subagent#readme) and [docs/COST-ACCOUNTING.md](https://github.com/LukasParke/pi-subagent/blob/main/docs/COST-ACCOUNTING.md).
+          See [README](https://github.com/LukasParke/pi-subagent#readme) and [docs/RELEASING.md](https://github.com/LukasParke/pi-subagent/blob/main/docs/RELEASING.md).
           EOF
           )"
 
@@ -119,18 +167,12 @@ jobs:
               "${{ steps.pack.outputs.tgz }}"
           fi
 
-      - name: Publish to npm
-        env:
-          # Optional fallback when Trusted Publishing is not configured.
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish to npm (Trusted Publishing / OIDC)
+        # Pure OIDC path: no NODE_AUTH_TOKEN. Provenance is automatic with trusted publishing.
+        # package.json publishConfig.provenance remains true as a belt-and-suspenders default.
         run: |
           set -euo pipefail
-          # Preferred: npm Trusted Publishing for this repo + workflow (OIDC).
-          # Fallback: repository secret NPM_TOKEN (Automation/granular publish token).
-          if [ -n "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "Using repository secret NPM_TOKEN for npm auth."
-          else
-            echo "NPM_TOKEN not set; authenticating via npm Trusted Publishing (OIDC)."
-          fi
-
-          npm publish --access public --provenance --ignore-scripts
+          # Ensure a blank token is not injected by the runner environment or prior steps.
+          unset NODE_AUTH_TOKEN || true
+          unset NPM_TOKEN || true
+          npm publish --access public --ignore-scripts
