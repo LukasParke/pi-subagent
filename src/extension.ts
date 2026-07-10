@@ -1,6 +1,5 @@
 import { Buffer } from "node:buffer";
 import type { ExtensionAPI, ExtensionContext, Theme, ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
-import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Container, Text, type Component, type TUI } from "@earendil-works/pi-tui";
 import { Value } from "typebox/value";
 import { defaultConfig, type SubagentConfig } from "./config.js";
@@ -183,12 +182,9 @@ function lineComponent(render: (width: number) => string[]): Component {
 }
 
 function expandHint(): string {
-  try {
-    return keyHint("app.tools.expand", "expand");
-  } catch {
-    // Headless SDK/tests may not initialize Pi's global theme.
-    return "expand";
-  }
+  // Keep the coding-agent package type-only so Node 20 does not load Pi's
+  // provider/network stack merely to render a label.
+  return "expand";
 }
 
 function fail(message: string): never {
