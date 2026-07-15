@@ -4,8 +4,8 @@ Pi installs packages from **npm** or **git**. Publishing binds both:
 
 | Source | Install command | Needs |
 |--------|-----------------|-------|
-| npm | `pi install npm:@lukehagar/pi-subagent@0.2.0` | npm publish + `pi-package` keyword |
-| git | `pi install git:github.com/LukasParke/pi-subagent@v0.2.0` | GitHub Release / tag |
+| npm | `pi install npm:@parke.dev/pi-subagent@0.2.1` | npm publish + `pi-package` keyword |
+| git | `pi install git:github.com/LukasParke/pi-subagent@v0.2.1` | GitHub Release / tag |
 | local | `pi install /path/to/pi-subagent` | checkout only |
 
 The [pi.dev package gallery](https://pi.dev/packages) lists npm packages that declare the `pi-package` keyword (already set in `package.json`).
@@ -18,17 +18,34 @@ No long-lived `NPM_TOKEN` is required or used.
 
 ### 1. Ensure the package exists on npm
 
-Trusted Publisher settings live under the **package** page.
+Trusted Publisher settings live under the **package** page, and **npm cannot
+create a brand-new package via OIDC** — the very first publish of a new name
+must use a traditional auth path (interactive `npm publish` from a logged-in
+maintainer, or a short-lived granular token). After that first publish,
+configure the trusted publisher and revoke the token.
 
-**Name note:** unscoped `pi-subagent` is blocked by npm as too similar to the
-existing package [`pi-sub-agent`](https://www.npmjs.com/package/pi-sub-agent).
-This project publishes as **`@lukehagar/pi-subagent`** instead.
+**Name notes:**
 
-Confirm after first publish: https://www.npmjs.com/package/@lukehagar/pi-subagent
+- unscoped `pi-subagent` is blocked by npm as too similar to the existing
+  package [`pi-sub-agent`](https://www.npmjs.com/package/pi-sub-agent).
+- This project publishes as **`@parke.dev/pi-subagent`** (the `parke.dev`
+  npm org owns the scope).
+- `@lukehagar/pi-subagent` (≤ 0.2.0) is the deprecated predecessor — see
+  [Scope migration](#scope-migration-lukehagar--parkedev) below.
+
+Bootstrap the new package once from a local checkout:
+
+```bash
+npm login            # as a member of the parke.dev org
+npm run release:check
+npm publish --access public --ignore-scripts
+```
+
+Confirm: https://www.npmjs.com/package/@parke.dev/pi-subagent
 
 ### 2. Add the trusted publisher
 
-On https://www.npmjs.com/package/pi-subagent → **Settings** → **Trusted Publisher**:
+On https://www.npmjs.com/package/@parke.dev/pi-subagent → **Settings** → **Trusted Publisher**:
 
 | Field | Value |
 |-------|-------|
@@ -89,17 +106,36 @@ gh run list --workflow release.yml --limit 3
 gh run watch
 ```
 
+## Scope migration (`@lukehagar` → `@parke.dev`)
+
+Versions ≤ 0.2.0 were published as `@lukehagar/pi-subagent`. npm scopes cannot
+be renamed or transferred, so from 0.2.1 the package lives at
+`@parke.dev/pi-subagent`. The old package stays on npm (existing installs keep
+working) and is deprecated with a pointer:
+
+```bash
+npm deprecate @lukehagar/pi-subagent \
+  "Moved to @parke.dev/pi-subagent — pi install npm:@parke.dev/pi-subagent"
+```
+
+Users migrate with:
+
+```bash
+pi remove @lukehagar/pi-subagent   # or edit Pi's package config
+pi install npm:@parke.dev/pi-subagent
+```
+
 ## Install after publish
 
 ```bash
 # npm (gallery / versioned)
-pi install npm:@lukehagar/pi-subagent@0.2.0
+pi install npm:@parke.dev/pi-subagent@0.2.1
 
 # latest npm
-pi install npm:@lukehagar/pi-subagent
+pi install npm:@parke.dev/pi-subagent
 
 # git pin to the release tag
-pi install git:github.com/LukasParke/pi-subagent@v0.2.0
+pi install git:github.com/LukasParke/pi-subagent@v0.2.1
 
 # live main (not a release pin)
 pi install git:github.com/LukasParke/pi-subagent

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1
+
+- **Package moved to `@parke.dev/pi-subagent`** (owned by the `parke.dev` npm
+  org). `@lukehagar/pi-subagent` is deprecated at 0.2.0 and will receive no
+  further updates; install the new scope with
+  `pi install npm:@parke.dev/pi-subagent`. No code changes besides the rename.
+- CI/release workflows on actions/checkout@v7 + actions/setup-node@v7;
+  CI matrix trimmed to supported LTS lines (22, 24); `engines.node` corrected
+  to `>=22.19.0` (the actual pi-coding-agent floor).
+
 ## 0.2.0
 
 Major feature release: reliability engine, named agents, background-run UX,
