@@ -11,11 +11,17 @@ Legend: effort S (<½ day) / M (1–2 days) / L (3+ days) · impact ▲ high / �
 
 ---
 
-## Phase 1 — Structured results (v0.3.0)
+## Phase 1 — Structured results (v0.3.0) — ✅ SHIPPED
 
 The single biggest remaining quality gap. Free-text child output forces the
 parent to re-parse prose, which is fragile and burns tokens. oh-my-pi's
 `yield` protocol validates the design; we adapt it to our process boundary.
+
+> Implemented in `src/structured.ts` + runner/policy/output wiring: 1.1
+> (output_schema with settle-gated validation and one steer-based repair
+> round, agent-file `output_schema:` inline or `@file.json`), 1.2 (validated
+> JSON handoff to synthesis), 1.3 (conservative arg repair). E2E-verified
+> against real Pi.
 
 ### 1.1 `output_schema` — validated structured output ▲ M
 

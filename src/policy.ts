@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import type { AgentDefinition } from "./agents.js";
 import { resolveAgent } from "./agents.js";
+import { isPlausibleSchema, repairDoubleEncodedText } from "./structured.js";
 import { defaultConfig, type TaskDefaults, type TaskDefaultsByProfile } from "./config.js";
 import type { OutputMode, TaskProfile, TaskSpec } from "./types.js";
 import type { ParallelTaskInput, SubagentParams } from "./schema.js";
@@ -112,6 +113,7 @@ function normalizeTask(
     context?: "fresh" | "fork";
     output?: string;
     output_mode?: OutputMode;
+    output_schema?: Record<string, unknown>;
     resume?: string;
     fork_resume?: boolean;
     isolation?: "shared" | "worktree";
@@ -157,6 +159,9 @@ function normalizeTask(
       return { error: `Task ${index + 1}: context:'fork' requires a persisted parent session; this session has no session file. Use context:'fresh'.` };
     }
   }
+  if (item.output_schema !== undefined && !isPlausibleSchema(item.output_schema)) {
+    return { error: `Task ${index + 1}: output_schema must be a JSON Schema object (type/properties/required)` };
+  }
 
   const profile = item.profile ?? agent?.profile ?? defaultProfile;
   const requestedTools = item.tools ?? agent?.tools;
@@ -175,8 +180,8 @@ function normalizeTask(
   return {
     task: {
       label,
-      task: item.task.trim(),
-      systemPrompt,
+      task: repairDoubleEncodedText(item.task.trim()),
+      systemPrompt: systemPrompt ? repairDoubleEncodedText(systemPrompt) : systemPrompt,
       model: item.model || agent?.model || profileDefaults.model || parent.model,
       thinking: item.thinking ?? agent?.thinking ?? profileDefaults.thinking ?? parent.thinking,
       tools: resolved.tools,
@@ -194,6 +199,7 @@ function normalizeTask(
       parentSessionFile: item.context === "fork" ? parent.sessionFile : undefined,
       output,
       outputMode: item.output_mode,
+      outputSchema: item.output_schema ?? agent?.outputSchema,
       resume: item.resume,
       forkResume: item.fork_resume,
       isolation: item.isolation ?? agent?.isolation ?? "shared",

@@ -48,6 +48,19 @@ describe("agent file parsing", () => {
     expect(parseAgentFile("a", "---\ntools: read, grep\n---\nx", "/a.md", "project")!.tools).toEqual(["read", "grep"]);
     expect(parseAgentFile("b", '---\ntools: ["read", "grep"]\n---\nx', "/b.md", "project")!.tools).toEqual(["read", "grep"]);
   });
+
+  it("parses inline output_schema and drops invalid values", () => {
+    const inline = parseAgentFile(
+      "s",
+      '---\noutput_schema: {"type": "object", "required": ["findings"]}\n---\nbody',
+      "/s.md",
+      "project",
+    )!;
+    expect(inline.outputSchema).toEqual({ type: "object", required: ["findings"] });
+
+    const invalid = parseAgentFile("t", "---\noutput_schema: not-json\n---\nbody", "/t.md", "project")!;
+    expect(invalid.outputSchema).toBeUndefined();
+  });
 });
 
 describe("agent discovery", () => {
@@ -85,6 +98,19 @@ describe("agent discovery", () => {
 
   it("returns an empty catalog when no roots exist", () => {
     expect(discoverAgents(cwd).size).toBe(0);
+  });
+
+  it("resolves @file.json output_schema references relative to the agent file", async () => {
+    const dir = path.join(cwd, ".pi", "agents");
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "contract.json"), JSON.stringify({ type: "object", required: ["summary"] }));
+    await fs.writeFile(path.join(dir, "auditor.md"), "---\ndescription: audits\noutput_schema: @contract.json\n---\nbody");
+    const catalog = discoverAgents(cwd);
+    expect(catalog.get("auditor")!.outputSchema).toEqual({ type: "object", required: ["summary"] });
+
+    // Missing reference degrades to undefined, not an error.
+    await fs.writeFile(path.join(dir, "broken.md"), "---\noutput_schema: @missing.json\n---\nbody");
+    expect(discoverAgents(cwd).get("broken")!.outputSchema).toBeUndefined();
   });
 
   it("resolveAgent is case-insensitive and lists available names on miss", async () => {

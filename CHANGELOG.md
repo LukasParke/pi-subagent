@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.0
+
+### Structured results
+
+- **`output_schema`**: declare a JSON Schema per task (or in agent-file
+  frontmatter as inline JSON / `@contract.json`). The contract is appended to
+  the child's system prompt; the final message must end with a fenced
+  `json:result` block. Validation runs parent-side against a dependency-free
+  JSON-Schema subset (type/properties/required/items/enum/const; unknown
+  keywords ignored). Invalid output triggers **one steer-based repair round**
+  before the child is allowed to settle; still-invalid results end `partial`
+  with `structuredError` and the raw text delivered — paid work is never
+  discarded. Valid results deliver as clean JSON and surface as
+  `details.results[].structuredOutput`.
+- **Typed synthesis handoff**: validated parallel results feed the `synthesis`
+  child as JSON blocks instead of prose tails, with per-task validity flags.
+- **Arg repair**: double-encoded task/system-prompt text (literal `\n`/`\"`
+  escapes) is conservatively de-mangled once at validation time; identifier
+  fields and path-like strings are never touched.
+- UI: terminal rows annotate `✓ schema` / `schema ✗`.
+
 ## 0.2.1
 
 - **Package moved to `@parke.dev/pi-subagent`** (owned by the `parke.dev` npm

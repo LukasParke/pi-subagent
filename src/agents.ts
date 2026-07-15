@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { TaskProfile } from "./types.js";
 import type { ThinkingLevel } from "./config.js";
+import { isPlausibleSchema } from "./structured.js";
 
 /**
  * Named agent files: reusable subagent personas discovered from the same
@@ -47,6 +48,8 @@ export interface AgentDefinition {
   fallbackModels?: string[];
   maxRetries?: number;
   isolation?: "shared" | "worktree";
+  /** JSON Schema the persona's final result must satisfy (inline JSON or @file.json). */
+  outputSchema?: Record<string, unknown>;
 }
 
 /** Agent names are file-name-safe identifiers; anything else is skipped. */
@@ -89,6 +92,27 @@ function parseList(value: string): string[] {
 function parseNumber(value: string): number | undefined {
   const parsed = Number(value.trim());
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+/** `output_schema` value: inline single-line JSON, or `@relative/path.json`. */
+function parseSchemaValue(value: string, agentFile: string): Record<string, unknown> | undefined {
+  let text = value.trim();
+  if (text.startsWith("@")) {
+    const file = path.resolve(path.dirname(agentFile), text.slice(1));
+    try {
+      const stat = fs.lstatSync(file);
+      if (!stat.isFile() || stat.size > 64 * 1024) return undefined;
+      text = fs.readFileSync(file, "utf8");
+    } catch {
+      return undefined;
+    }
+  }
+  try {
+    const parsed = JSON.parse(text);
+    return isPlausibleSchema(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function parseAgentFile(name: string, raw: string, source: string, scope: AgentDefinition["scope"]): AgentDefinition | undefined {
@@ -134,6 +158,7 @@ export function parseAgentFile(name: string, raw: string, source: string, scope:
     fallbackModels: frontmatter.fallback_models ? parseList(frontmatter.fallback_models) : undefined,
     maxRetries: frontmatter.max_retries ? parseNumber(frontmatter.max_retries) : undefined,
     isolation,
+    outputSchema: frontmatter.output_schema ? parseSchemaValue(frontmatter.output_schema, source) : undefined,
   };
   return definition;
 }

@@ -100,6 +100,8 @@ export function toPersistedResult(result: TaskResult): PersistedResult {
     stalledSince: result.stalledSince,
     attempts: result.attempts,
     attemptedModels: result.attemptedModels,
+    structuredOutput: result.structuredOutput,
+    structuredError: result.structuredError,
   };
 }
 
@@ -124,6 +126,8 @@ function resultFingerprint(result: TaskResult): string {
     result.stalledSince ?? 0,
     result.attempts ?? 0,
     result.worktree ? 1 : 0,
+    result.structuredOutput !== undefined ? 1 : 0,
+    result.structuredError?.length ?? 0,
   ].join("|");
 }
 

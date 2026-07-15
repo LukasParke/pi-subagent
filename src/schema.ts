@@ -44,6 +44,14 @@ export const TaskFields = {
     }),
   ),
   output: Type.Optional(Type.String({ description: "File path to write final output." })),
+  output_schema: Type.Optional(
+    Type.Unsafe<Record<string, unknown>>(
+      Type.Object({}, {
+        additionalProperties: true,
+        description: "JSON Schema the child's final result must satisfy. The child ends with a fenced json:result block; validation failures get one steer-based repair round, then end 'partial' with the errors reported.",
+      }),
+    ),
+  ),
   output_mode: Type.Optional({ ...OutputMode, description: "file-only returns a pointer instead of inline text; use for large reports." }),
   resume: Type.Optional(Type.String({ description: "Child session id to continue." })),
   fork_resume: Type.Optional(Type.Boolean({ description: "Fork the resumed session instead of direct resume." })),

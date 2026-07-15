@@ -31,6 +31,10 @@
 - `usage.ts`: provider-reported root/subagent/combined accounting.
 - `policy.ts` / `schema.ts`: discriminated request validation and safe capability profiles.
 - `config.ts`: defaults ← `~/.pi/subagent.json` ← `PI_SUBAGENT_*` env overrides.
+- `structured.ts`: structured-output contract (dependency-free JSON-Schema subset
+  validation, fenced json:result extraction, contract/repair prompts) and
+  conservative double-encoded-arg repair. The runner gates the child's settle on
+  validation and runs one steer-based repair round before accepting failure.
 - `agents.ts`: named agent files (`.pi/agents/`, `.agents/agents/`, global agent dir).
   Flat-YAML frontmatter + markdown persona body; resolved in policy with explicit
   params > agent file > profile taskDefaults > parent inheritance. Catalog refreshes
@@ -101,3 +105,10 @@ Invariants:
     suppresses the notification.
 24. Named agent files supply per-field defaults only; explicit request params always
     win, and capability profiles fail closed regardless of what an agent file declares.
+25. Structured-output validation never discards paid work: schema failure after the
+    repair round downgrades completed → partial with `structuredError`, and the raw
+    text still delivers. Validation is enforced on the parent side of the process
+    boundary — the child cannot self-attest.
+26. Arg repair only decodes free-text fields with high-signal escape patterns
+    (literal \n or \") and no real newlines; identifier fields, tool lists, and
+    Windows-path-like strings are never modified.

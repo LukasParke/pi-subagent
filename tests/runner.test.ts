@@ -286,4 +286,43 @@ describe("ChildRunner", () => {
     const result = await runner.run({ ...defaultSpec, label: "Audit auth" });
     expect(result.label).toBe("Audit auth");
   });
+
+  const schema = {
+    type: "object",
+    required: ["files", "risk"],
+    properties: { files: { type: "array", items: { type: "string" } }, risk: { type: "string" } },
+  };
+
+  it("validates structured output and attaches the parsed value", async () => {
+    process.env.FAKE_PI_MODE = "schema-good";
+    const result = await runner.run({ ...defaultSpec, outputSchema: schema, timeoutMs: 8_000 });
+    expect(result.state).toBe("completed");
+    expect(result.structuredOutput).toEqual({ files: ["a.ts"], risk: "low" });
+    expect(result.structuredError).toBeUndefined();
+  });
+
+  it("runs one steer-based repair round on invalid structured output", async () => {
+    process.env.FAKE_PI_MODE = "schema-repair";
+    const result = await runner.run({ ...defaultSpec, outputSchema: schema, timeoutMs: 8_000 });
+    expect(result.state).toBe("completed");
+    expect(result.structuredOutput).toEqual({ files: ["a.ts"], risk: "low" });
+  });
+
+  it("downgrades to partial with errors when repair also fails; raw text preserved", async () => {
+    process.env.FAKE_PI_MODE = "schema-bad";
+    const result = await runner.run({ ...defaultSpec, outputSchema: schema, timeoutMs: 8_000 });
+    expect(result.state).toBe("partial");
+    expect(result.stopReason).toBe("schema_mismatch");
+    expect(result.structuredOutput).toBeUndefined();
+    expect(result.structuredError).toMatch(/json:result/i);
+    expect(result.errorMessage).toMatch(/after one repair round/i);
+    expect(result.liveText).toContain("prose"); // paid work still delivered
+  });
+
+  it("schema validation does not interfere with runs that omit output_schema", async () => {
+    process.env.FAKE_PI_MODE = "schema-bad";
+    const result = await runner.run({ ...defaultSpec, timeoutMs: 8_000 });
+    expect(result.state).toBe("completed");
+    expect(result.structuredError).toBeUndefined();
+  });
 });

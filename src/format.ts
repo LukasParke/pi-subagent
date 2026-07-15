@@ -130,6 +130,8 @@ export interface InlineTaskView {
   wrappedUp?: boolean;
   stalledSince?: number;
   attempts?: number;
+  structuredOutput?: unknown;
+  structuredError?: string;
 }
 
 export interface InlineRunView {
@@ -174,6 +176,10 @@ function taskAnnotations(task: InlineTaskView, now: number): string[] {
   const notes: string[] = [];
   if (task.attempts && task.attempts > 1) notes.push(`attempt ${task.attempts}`);
   if (task.stalledSince && isActiveState(task.state)) notes.push(`stalled ${formatDuration(now - task.stalledSince)}`);
+  if (!isActiveState(task.state)) {
+    if (task.structuredOutput !== undefined) notes.push('✓ schema');
+    else if (task.structuredError) notes.push('schema ✗');
+  }
   return notes;
 }
 

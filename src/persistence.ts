@@ -40,6 +40,10 @@ export interface PersistedResult {
   attempts?: number;
   /** Models tried across attempts, in order. */
   attemptedModels?: string[];
+  /** Parsed structured result when output_schema validated. */
+  structuredOutput?: unknown;
+  /** Validation errors when output_schema was requested but failed. */
+  structuredError?: string;
 }
 
 export interface PersistenceEventData {
@@ -158,6 +162,10 @@ function normalizeResult(value: unknown): PersistedResult | undefined {
     attemptedModels: Array.isArray(r.attemptedModels)
       ? r.attemptedModels.filter((m): m is string => typeof m === "string").slice(0, 10)
       : undefined,
+    structuredOutput: r.structuredOutput !== undefined && Buffer.byteLength(JSON.stringify(r.structuredOutput) ?? "", "utf8") <= 32_768
+      ? r.structuredOutput
+      : undefined,
+    structuredError: typeof r.structuredError === "string" ? utf8Prefix(r.structuredError, 1_000) : undefined,
   };
 }
 

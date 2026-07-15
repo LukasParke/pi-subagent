@@ -14,6 +14,7 @@ import {
   type SlotToken,
 } from "./process-lock.js";
 import { createGetPiCommand } from "./launch.js";
+import { checkAgainstSchema, extractStructuredResult, repairMessage, schemaContract } from "./structured.js";
 
 export type GetPiCommand = (args: string[]) => { command: string; args: string[] };
 
@@ -128,6 +129,8 @@ export class ChildRunner {
     // up and allowed `graceTurns` more turns before SIGTERM.
     let pendingBudgetStop: { reason: "max_turns" | "max_cost"; deadlineTurns: number } | undefined;
     let wrappedUp = false;
+    // Structured-output repair state: one steer-based retry after failed validation.
+    let schemaRepairAttempted = false;
     // Stall watchdog state.
     let lastEventAt = Date.now();
     let stallTimer: NodeJS.Timeout | undefined;
@@ -336,6 +339,22 @@ export class ChildRunner {
           // A settle during the wrap-up window means the child finished its
           // final answer in time.
           if (pendingBudgetStop && !requestedStop) wrappedUp = true;
+          // Structured-output gate: validate before letting the child exit.
+          // Invalid → one steer-based repair round (a fresh prompt keeps the
+          // RPC child alive and produces a new settle when it finishes).
+          if (spec.outputSchema && !requestedStop && !pendingBudgetStop) {
+            const extracted = extractStructuredResult(parser.getLiveText());
+            const check = extracted.value !== undefined
+              ? checkAgainstSchema(extracted.value, spec.outputSchema)
+              : { ok: false, errors: [extracted.raw ? "json:result block did not parse as JSON" : "no json:result block found in the final message"] };
+            if (!check.ok && !schemaRepairAttempted) {
+              schemaRepairAttempted = true;
+              if (this.sendCommand?.({ type: "prompt", message: repairMessage(check.errors) })) {
+                lastEventAt = Date.now();
+                continue; // repair round in flight: do not close stdin yet
+              }
+            }
+          }
           try { processHandle?.stdin?.end(); } catch { /* already closed */ }
         }
       }
@@ -434,10 +453,14 @@ export class ChildRunner {
         if (tools.length === 0) args.push("--no-tools");
         else args.push("--tools", tools.join(","));
       }
-      if (spec.systemPrompt?.trim()) {
+      // Persona/system prompt first, structured-output contract last (highest salience).
+      const appendPrompt = [spec.systemPrompt?.trim(), spec.outputSchema ? schemaContract(spec.outputSchema) : undefined]
+        .filter(Boolean)
+        .join("\n\n");
+      if (appendPrompt) {
         tempPromptDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-subagent-prompt-"));
         const promptPath = path.join(tempPromptDir, "system-prompt.md");
-        await fs.writeFile(promptPath, spec.systemPrompt, { encoding: "utf8", mode: 0o600 });
+        await fs.writeFile(promptPath, appendPrompt, { encoding: "utf8", mode: 0o600 });
         args.push("--append-system-prompt", promptPath);
       }
 
@@ -588,6 +611,26 @@ export class ChildRunner {
         result.stopReason = pendingBudgetStop.reason;
         result.wrappedUp = true;
         result.errorMessage = `Reached ${pendingBudgetStop.reason.replace("_", " ")} budget and wrapped up gracefully`;
+      }
+
+      // Structured-output verdict: validate the final text once, after any
+      // repair round. Failure downgrades completed → partial (paid work is
+      // still delivered; the parent sees why it is not machine-readable).
+      if (spec.outputSchema) {
+        const extracted = extractStructuredResult(result.liveText);
+        const check = extracted.value !== undefined
+          ? checkAgainstSchema(extracted.value, spec.outputSchema)
+          : { ok: false, errors: [extracted.raw ? "json:result block did not parse as JSON" : "no json:result block found in the final message"] };
+        if (check.ok) {
+          result.structuredOutput = extracted.value;
+        } else {
+          result.structuredError = check.errors.slice(0, 10).join("; ");
+          if ((result.state as TaskResult["state"]) === "completed") {
+            result.state = "partial";
+            result.stopReason = "schema_mismatch";
+            result.errorMessage = `Structured output failed validation${schemaRepairAttempted ? " (after one repair round)" : ""}: ${result.structuredError}`;
+          }
+        }
       }
 
       if (this.locks && this.runId) {

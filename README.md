@@ -16,13 +16,13 @@ Pi packages install from **npm**, **git**, or a **local path**:
 ```bash
 # npm (scoped; surfaces on the pi.dev gallery via the pi-package keyword)
 # Note: unscoped "pi-subagent" is rejected by npm as too similar to "pi-sub-agent".
-pi install npm:@parke.dev/pi-subagent@0.2.1
+pi install npm:@parke.dev/pi-subagent@0.3.0
 
 # latest npm
 pi install npm:@parke.dev/pi-subagent
 
 # git pin to a release tag
-pi install git:github.com/LukasParke/pi-subagent@v0.2.1
+pi install git:github.com/LukasParke/pi-subagent@v0.3.0
 
 # live main
 pi install git:github.com/LukasParke/pi-subagent
@@ -74,6 +74,21 @@ Publishing is automated from `v*` tags — see [docs/RELEASING.md](./docs/RELEAS
 { action: "status", id: "abc123" }
 { action: "wait", id: "abc123" }      // interruptible; does not cancel
 { action: "cancel", id: "abc123" }
+
+// Structured output: the child must end with a fenced json:result block
+// matching the schema. Invalid output gets one automatic repair round;
+// delivery is the clean JSON and details carry the parsed object.
+{
+  task: "Audit the auth module",
+  output_schema: {
+    type: "object",
+    required: ["findings", "risk"],
+    properties: {
+      findings: { type: "array", items: { type: "string" } },
+      risk: { type: "string", enum: ["low", "medium", "high"] }
+    }
+  }
+}
 
 // Fork the parent conversation into the child (needs a persisted session).
 // The child starts from a branched copy of everything discussed so far.
@@ -180,6 +195,10 @@ and sensitive data exposure. Report findings with file:line evidence and
 severity ratings.
 ```
 
+Agent files may also pin a structured contract with
+`output_schema: {"type": "object", …}` (single-line inline JSON) or
+`output_schema: @contract.json` (path relative to the agent file).
+
 Invoke with `{ task: "…", agent: "reviewer" }`. Precedence per field:
 **explicit request params > agent file > per-profile `taskDefaults` > parent
 inheritance**. An explicit `system_prompt` appends after the persona body.
@@ -231,6 +250,18 @@ Notes on behavior:
   parent conversation (`--fork` on the parent's session file). It requires a
   persisted parent session, cannot combine with `resume`, and is rejected for
   parallel fanout (context duplication × N is a cost bug, not a feature).
+- **Structured output** (`output_schema`): the contract is appended to the
+  child's system prompt; the final message must end with a fenced
+  `json:result` block. Validation runs parent-side against a dependency-free
+  JSON-Schema subset (type/properties/required/items/enum/const — unknown
+  keywords are ignored, never rejected). Invalid output triggers **one
+  steer-based repair round**; still-invalid results end `partial` with
+  `structuredError` set and the raw text delivered — paid work is never
+  discarded. Validated parallel results feed the `synthesis` child as clean
+  JSON instead of prose.
+- **Arg repair**: double-encoded task text (literal `\n` / `\"` escapes from
+  LLM re-encoding) is conservatively de-mangled once at validation time.
+  Identifier fields and paths are never touched.
   Protocol streams truncated after useful assistant output also end as `partial`.
 - Aborting a `wait` returns immediately without cancelling the background run.
 - Child processes are launched via the same Node runtime + CLI entry as the

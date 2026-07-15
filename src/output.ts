@@ -82,6 +82,10 @@ export class OutputManager {
         raw = result.outputFile
           ? `Output written to ${result.outputFile}${result.sessionId ? `\nSession: ${result.sessionId}` : ""}`
           : result.errorMessage || "file-only output requested, but no artifact was produced";
+      } else if (result.structuredOutput !== undefined) {
+        // Validated structured result: deliver the machine-readable JSON, not
+        // the narrative preamble around the fenced block.
+        raw = JSON.stringify(result.structuredOutput, null, 2);
       } else {
         raw = result.finalOutput || finalAssistantText(result.messages || []) || result.liveText || result.errorMessage || result.stderr || "(no output)";
       }

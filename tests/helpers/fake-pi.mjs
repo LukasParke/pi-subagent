@@ -27,6 +27,7 @@ if (isMain) {
   const delay = Number(process.env.FAKE_PI_DELAY_MS || 0);
   const emit = (value, newline = true) => process.stdout.write(JSON.stringify(value) + (newline ? "\n" : ""));
   let promptSeen = false;
+  let promptCount = 0;
   const steered = [];
 
   const runScript = async () => {
@@ -135,6 +136,64 @@ if (isMain) {
       process.exit(0);
       return;
     }
+    if (mode === "schema-good") {
+      // Emits a valid fenced json:result block on the first prompt.
+      emit(header);
+      emit({
+        ...message,
+        message: { ...message.message, content: [{ type: "text", text: 'Here are my findings.\n\n```json:result\n{"files": ["a.ts"], "risk": "low"}\n```' }] },
+      });
+      emit(agentEnd);
+      emit(agentSettled);
+      // Stay alive: real RPC children wait for stdin close after settle.
+      return;
+    }
+    if (mode === "schema-repair") {
+      // First result is invalid (missing required field); the repair prompt
+      // triggers a corrected block. Exercises the steer-based repair round.
+      emit(header);
+      emit({
+        ...message,
+        message: { ...message.message, content: [{ type: "text", text: '```json:result\n{"files": []}\n```' }] },
+      });
+      emit(agentEnd);
+      emit(agentSettled);
+      // Wait for the repair prompt (second prompt command), then emit valid output.
+      const deadline = Date.now() + Number(process.env.FAKE_PI_PAUSE_MS || 3_000);
+      while (promptCount < 2 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      if (promptCount >= 2) {
+        emit({
+          ...message,
+          message: { ...message.message, content: [{ type: "text", text: 'Corrected.\n```json:result\n{"files": ["a.ts"], "risk": "low"}\n```' }] },
+        });
+        emit(agentEnd);
+        emit(agentSettled);
+      }
+      return;
+    }
+    if (mode === "schema-bad") {
+      // Always emits invalid output, even after the repair prompt.
+      emit(header);
+      const bad = () => emit({
+        ...message,
+        message: { ...message.message, content: [{ type: "text", text: "No JSON here, just prose." }] },
+      });
+      bad();
+      emit(agentEnd);
+      emit(agentSettled);
+      const deadline = Date.now() + Number(process.env.FAKE_PI_PAUSE_MS || 3_000);
+      while (promptCount < 2 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      if (promptCount >= 2) {
+        bad();
+        emit(agentEnd);
+        emit(agentSettled);
+      }
+      return;
+    }
     if (mode === "steer-echo") {
       // Emit header + first message, wait for a steer command, then echo it back
       // in a second assistant message and settle.
@@ -187,9 +246,12 @@ if (isMain) {
       if (!line.trim()) continue;
       let command;
       try { command = JSON.parse(line); } catch { continue; }
-      if (command.type === "prompt" && !promptSeen) {
-        promptSeen = true;
-        void runScript();
+      if (command.type === "prompt") {
+        promptCount++;
+        if (!promptSeen) {
+          promptSeen = true;
+          void runScript();
+        }
       }
       if (command.type === "get_state" && mode !== "stall") {
         // A truly hung child answers nothing — stall mode ignores liveness probes.

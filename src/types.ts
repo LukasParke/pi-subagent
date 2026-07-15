@@ -66,6 +66,8 @@ export interface TaskSpec {
   contextFork?: boolean;
   /** Parent session file used for contextFork. */
   parentSessionFile?: string;
+  /** JSON-Schema subset the child's final fenced json:result block must satisfy. */
+  outputSchema?: Record<string, unknown>;
 }
 
 export interface TaskResult {
@@ -107,6 +109,10 @@ export interface TaskResult {
   attempts?: number;
   /** Models tried across attempts, in order. */
   attemptedModels?: string[];
+  /** Parsed structured result when output_schema was requested and validated. */
+  structuredOutput?: unknown;
+  /** Validation errors when output_schema was requested but the result failed. */
+  structuredError?: string;
   protocol: {
     headerSeen: boolean;
     assistantEndSeen: boolean;
@@ -154,6 +160,8 @@ export interface RunSnapshot {
     stalledSince?: number;
     attempts?: number;
     attemptedModels?: string[];
+    structuredOutput?: unknown;
+    structuredError?: string;
   }>;
 }
 

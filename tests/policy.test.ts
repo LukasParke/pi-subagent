@@ -275,6 +275,24 @@ describe("policy", () => {
     expect(invalid.ok).toBe(false);
   });
 
+  it("validates and passes output_schema through; repairs double-encoded task text", () => {
+    const good = validateSubagentRequest(
+      { task: "x", output_schema: { type: "object", required: ["a"] } },
+      parent,
+    );
+    expect(good.ok).toBe(true);
+    if (good.ok) expect(good.tasks[0]!.outputSchema).toEqual({ type: "object", required: ["a"] });
+
+    const bad = validateSubagentRequest({ task: "x", output_schema: { type: 42 } as any }, parent);
+    expect(bad.ok).toBe(false);
+    if (!bad.ok) expect(bad.error).toMatch(/output_schema/);
+
+    // Double-encoded task text is de-mangled once.
+    const mangled = validateSubagentRequest({ task: "step 1\\nstep 2" }, parent);
+    expect(mangled.ok).toBe(true);
+    if (mangled.ok) expect(mangled.tasks[0]!.task).toBe("step 1\nstep 2");
+  });
+
   it("synthesis is parallel-only and passes through trimmed", () => {
     const single = validateSubagentRequest({ task: "x", synthesis: "fold it" }, parent);
     expect(single.ok).toBe(false);

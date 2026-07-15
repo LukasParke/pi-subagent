@@ -283,6 +283,8 @@ function compactDetails(
       stalledSince: result.stalledSince,
       attempts: result.attempts,
       attemptedModels: result.attemptedModels,
+      structuredOutput: result.structuredOutput,
+      structuredError: result.structuredError,
     })),
   };
 }
@@ -359,6 +361,7 @@ function guidelines(catalog?: Map<string, AgentDefinition>): string[] {
     "context:'fork' starts a single child from a branched copy of this conversation — use it when the task depends on discussion context instead of re-explaining. Single-task only.",
     "Use async:true only when you have independent work meanwhile; then use action:'wait' with the run id (interruptible, does not cancel). action:'steer' injects mid-run guidance into a running child instead of cancel + retry.",
     "For parallel research, add synthesis:'<instruction>' to have one read-only child fold all outputs into a single brief, delivered first.",
+    "Use output_schema (JSON Schema) when you need a machine-readable result: the child must end with a validated json:result block, invalid output gets one automatic repair round, and delivery is the clean JSON. Compose downstream steps from details.results[].structuredOutput.",
     "Use output_mode:'file-only' for large reports; the parent gets a pointer instead of inline text.",
     "resume:'<child session id>' continues a finished child with context intact; fork_resume:true branches it instead.",
   ];
@@ -376,15 +379,22 @@ async function runSynthesis(
   options: { runId: string; model?: string; signal: AbortSignal },
 ): Promise<TaskResult | undefined> {
   const sections = results.map((result, index) => {
+    // Typed handoff: validated structured results feed the synthesis child
+    // clean JSON instead of prose tails.
+    if (result.structuredOutput !== undefined) {
+      const json = JSON.stringify(result.structuredOutput, null, 2).slice(0, 12_000);
+      return `## Task ${index + 1}: ${result.label} [${result.state}] (validated structured result)\n\n\`\`\`json\n${json}\n\`\`\``;
+    }
     const raw = result.liveText ?? result.errorMessage ?? "(no output)";
     const capped = raw.length > 12_000;
     const body = capped
       ? `${raw.slice(0, 12_000)}\n[… truncated ${raw.length - 12_000} chars; ${result.outputFile ? `full output: ${result.outputFile}` : "full output in the child session"}]`
       : raw;
+    const invalid = result.structuredError ? `\n[structured output FAILED validation: ${result.structuredError}]` : "";
     const pointer = result.outputFile ? `\nFull output file: ${result.outputFile}` : "";
-    return `## Task ${index + 1}: ${result.label} [${result.state}]${pointer}\n\n${body}`;
+    return `## Task ${index + 1}: ${result.label} [${result.state}]${pointer}${invalid}\n\n${body}`;
   });
-  const anyTruncated = results.some((result) => (result.liveText ?? result.errorMessage ?? "").length > 12_000);
+  const anyTruncated = results.some((result) => result.structuredOutput === undefined && (result.liveText ?? result.errorMessage ?? "").length > 12_000);
   const task = [
     "You are a synthesis agent. Fold the following subagent task outputs into one coherent brief.",
     `Instruction: ${instruction}`,
@@ -844,6 +854,7 @@ export default function registerSubagent(pi: ExtensionAPI): void {
         maxCost: task.maxCost,
         output: task.output,
         outputMode: task.outputMode,
+        outputSchema: task.outputSchema,
         resume: task.resume,
         forkResume: task.forkResume,
         isolation: task.isolation,
@@ -1045,6 +1056,8 @@ export default function registerSubagent(pi: ExtensionAPI): void {
           wrappedUp: task.wrappedUp,
           stalledSince: task.stalledSince,
           attempts: task.attempts,
+          structuredOutput: task.structuredOutput,
+          structuredError: task.structuredError,
         })),
       };
       const active = options.isPartial && (isActiveState(detailsValue.state) || run.results.some((task) => isActiveState(task.state)) || detailsValue.state === undefined);

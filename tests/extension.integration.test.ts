@@ -367,6 +367,37 @@ describe("extension end-to-end wiring", () => {
     await h.handlers.get("session_shutdown")!();
   });
 
+  it("delivers validated structured output as JSON end-to-end", async () => {
+    const h = harness();
+    await h.handlers.get("session_start")!({}, h.ctx);
+    process.env.FAKE_PI_MODE = "schema-good";
+    const result = await execute(h, {
+      task: "audit files",
+      profile: "explore",
+      output_schema: { type: "object", required: ["files", "risk"] },
+    });
+    expect(result.isError).not.toBe(true);
+    // Delivery is the machine-readable JSON, not the narrative preamble.
+    expect(JSON.parse(result.content[0].text)).toEqual({ files: ["a.ts"], risk: "low" });
+    expect(result.details.results[0].structuredOutput).toEqual({ files: ["a.ts"], risk: "low" });
+    await h.handlers.get("session_shutdown")!();
+  });
+
+  it("schema failure ends partial with the raw text still delivered", async () => {
+    const h = harness();
+    await h.handlers.get("session_start")!({}, h.ctx);
+    process.env.FAKE_PI_MODE = "schema-bad";
+    const result = await execute(h, {
+      task: "audit files",
+      profile: "explore",
+      output_schema: { type: "object", required: ["files"] },
+    });
+    expect(result.isError).not.toBe(true); // partial, not failed
+    expect(result.content[0].text).toContain("prose");
+    expect(result.details.results[0].structuredError).toBeTruthy();
+    await h.handlers.get("session_shutdown")!();
+  });
+
   it("rejects worktree actions on runs without changed worktrees", async () => {
     const h = harness();
     await h.handlers.get("session_start")!({}, h.ctx);
