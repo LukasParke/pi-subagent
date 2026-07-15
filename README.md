@@ -307,6 +307,12 @@ usage. The footer stays terse (running/ready counts only) because Pi's native
 footer already reports session cost. Delivery and replay do not double count
 runs. See [docs/COST-ACCOUNTING.md](./docs/COST-ACCOUNTING.md).
 
+## Roadmap
+
+Planned work — structured output schemas, agent spawn policies, engine
+hardening — lives in [docs/ROADMAP.md](./docs/ROADMAP.md) with design sketches
+and rationale for deferred features.
+
 ## Security
 
 See [docs/SECURITY.md](./docs/SECURITY.md). Pi packages run with full system
