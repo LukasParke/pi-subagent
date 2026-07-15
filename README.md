@@ -340,9 +340,10 @@ runs. See [docs/COST-ACCOUNTING.md](./docs/COST-ACCOUNTING.md).
 
 ## Roadmap
 
-Planned work — structured output schemas, agent spawn policies, engine
-hardening — lives in [docs/ROADMAP.md](./docs/ROADMAP.md) with design sketches
-and rationale for deferred features.
+Planned work — agent spawn policies, dry-run validation, engine hardening,
+live transcripts — lives in [docs/ROADMAP.md](./docs/ROADMAP.md) (rationale
+and design sketches) and [docs/PLAN.md](./docs/PLAN.md) (execution contract:
+work breakdown, acceptance criteria, test plans, and release gates per phase).
 
 ## Security
 

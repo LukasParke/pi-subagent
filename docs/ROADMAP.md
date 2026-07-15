@@ -1,5 +1,9 @@
 # Roadmap
 
+> Execution details for the remaining phases (work breakdown, acceptance
+> criteria, test plans, release gates) live in [PLAN.md](./PLAN.md). This
+> document holds the rationale, design sketches, and deferral decisions.
+
 Prioritized improvement plan, consolidated from four review passes: the
 competitor field study (@tintinweb, nicobailon), the strategic review, the
 fresh-eyes engine review, and the oh-my-pi task-system comparison. Each item
