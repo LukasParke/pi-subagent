@@ -60,6 +60,11 @@ export interface ProcessLockOptions {
   leaseMs?: number;
   /** Max concurrent child Pi processes machine-wide. 0 = no global limit. */
   maxGlobalActive?: number;
+  /**
+   * Nesting ceiling used for depth-tiered global slots. Defaults to
+   * `defaultConfig.maxDepth` so shallow tiers reserve room for deeper ones.
+   */
+  maxDepth?: number;
   /** Now override for tests. */
   now?: () => number;
   /** isAlive override for tests. */
@@ -228,6 +233,7 @@ export class ProcessLockManager {
   private readonly root: string;
   private readonly leaseMs: number;
   private readonly maxGlobalActive: number;
+  private readonly maxDepth: number;
   private readonly now: () => number;
   private readonly isAlive: (identity: ProcessIdentity) => boolean;
   private renewTimers = new Map<string, NodeJS.Timeout>();
@@ -236,6 +242,7 @@ export class ProcessLockManager {
     this.root = lockRoot(options.rootDir);
     this.leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
     this.maxGlobalActive = options.maxGlobalActive ?? 0;
+    this.maxDepth = options.maxDepth ?? defaultConfig.maxDepth;
     this.now = options.now ?? Date.now;
     this.isAlive = options.isAlive ?? isProcessAlive;
     ensureDirSync(this.root);
@@ -297,9 +304,8 @@ export class ProcessLockManager {
           this.startLeaseRenewal(childSessionId, existing);
           return { ok: true, lock: existing };
         }
-        const stale =
-          !this.isAlive(existing.process) ||
-          (existing.leaseExpiresAt > 0 && existing.leaseExpiresAt + this.leaseMs < this.now());
+        // Stale evaluation: see isSessionLockStale (host × identity × lease matrix).
+        const stale = this.isSessionLockStale(existing);
         if (stale && attempt === 0) {
           try {
             fs.unlinkSync(file);
@@ -378,18 +384,41 @@ export class ProcessLockManager {
   // ---- Global concurrency slots -------------------------------------------
 
   /**
-   * Try to claim a machine-wide concurrency slot. Returns undefined when the
-   * global cap is 0 (disabled) or when a slot is granted. Throws when full.
+   * Slots held back for strictly deeper nesting tiers so a shallow fan-out cannot
+   * exhaust the machine-wide cap while nested parents wait on their children.
+   *
+   * With defaults (cap 16, maxDepth 2): depth-0 may hold at most 15 slots, so
+   * depth-1 spawns always have ≥1 free. Single-level fan-out at maxDepth 1
+   * reserves 0 and can still fill the full cap.
+   *
+   * PLAN 3.1 numeric contract: reserve `max(0, maxDepth - 1 - depth)` (the
+   * written `min(depth, maxDepth-1)` form is inverted relative to the example).
    */
-  tryAcquireGlobalSlot(runId: string): SlotToken | undefined {
+  private reservedFor(depth: number): number {
+    if (this.maxDepth <= 1) return 0;
+    return Math.max(0, this.maxDepth - 1 - Math.max(0, depth));
+  }
+
+  /**
+   * Try to claim a machine-wide concurrency slot. Returns undefined when the
+   * global cap is 0 (disabled) or when a slot is granted. Throws when the
+   * tiered budget for `depth` is exhausted.
+   *
+   * Slot records store `depth` (migration: missing field counts as depth 0).
+   * Admission: `activeAtOrBelowDepth(depth) < maxGlobalActive - reservedFor(depth)`.
+   */
+  tryAcquireGlobalSlot(runId: string, depth = 0): SlotToken | undefined {
     if (!this.maxGlobalActive || this.maxGlobalActive <= 0) return undefined;
+    const normalizedDepth = Number.isFinite(depth) && depth > 0 ? Math.floor(depth) : 0;
     ensureDirSync(slotDir(this.root));
     this.reapDeadSlots();
-    // Count live slots.
-    const entries = fs.readdirSync(slotDir(this.root)).filter((name) => name.endsWith(".slot"));
-    if (entries.length >= this.maxGlobalActive) {
+    const limit = this.maxGlobalActive - this.reservedFor(normalizedDepth);
+    const activeAtOrBelow = this.countLiveSlotsAtOrBelow(normalizedDepth);
+    if (activeAtOrBelow >= limit || limit <= 0) {
       throw new Error(
-        `Machine-wide subagent process limit reached (${this.maxGlobalActive}). Wait for other Pi sessions to finish, raise PI_SUBAGENT_MAX_GLOBAL_ACTIVE, or cancel running subagents.`,
+        `Machine-wide subagent process limit reached (${this.maxGlobalActive}` +
+          `; depth ${normalizedDepth} budget ${Math.max(0, limit)}). ` +
+          `Wait for other Pi sessions to finish, raise PI_SUBAGENT_MAX_GLOBAL_ACTIVE, or cancel running subagents.`,
       );
     }
     const slotId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -398,6 +427,7 @@ export class ProcessLockManager {
     writeJsonAtomicSync(file, {
       slotId,
       runId,
+      depth: normalizedDepth,
       process: currentProcessIdentity(),
       acquiredAt: this.now(),
     });
@@ -412,6 +442,26 @@ export class ProcessLockManager {
     } catch {
       /* already gone */
     }
+  }
+
+  /** Count live slot files whose recorded depth is ≤ the given depth (missing → 0). */
+  private countLiveSlotsAtOrBelow(depth: number): number {
+    let entries: string[] = [];
+    try {
+      entries = fs.readdirSync(slotDir(this.root));
+    } catch {
+      return 0;
+    }
+    let count = 0;
+    for (const name of entries) {
+      if (!name.endsWith(".slot")) continue;
+      const file = path.join(slotDir(this.root), name);
+      const data = readJsonSync<{ depth?: number; process?: ProcessIdentity }>(file);
+      if (!data?.process || !this.isAlive(data.process)) continue;
+      const slotDepth = typeof data.depth === "number" && Number.isFinite(data.depth) ? data.depth : 0;
+      if (slotDepth <= depth) count++;
+    }
+    return count;
   }
 
   private reapDeadSlots(): void {
@@ -433,6 +483,52 @@ export class ProcessLockManager {
         }
       }
     }
+  }
+
+  /**
+   * Whether an existing session lock may be unlinked and reclaimed.
+   *
+   * Matrix (host match × identity-verifiable × lease):
+   * - Same host, start-time identity match, process dead → reclaim immediately.
+   * - Same host, identity unknown (no startTime) → reclaim after **2×** lease
+   *   (clock skew / PID recycle both plausible on one machine). Live PIDs
+   *   with unknown identity still need the 2× window even if the soft lease
+   *   expired once.
+   * - Different host (or otherwise not locally verifiable across hosts) →
+   *   reclaim after **one** lease period (`leaseExpiresAt < now`). Local
+   *   process checks are meaningless cross-host, so dead-looking hosts are
+   *   not treated as immediate free-for-all.
+   *
+   * Clock-skew assumption (inline): on the same host, clocks are shared so a
+   * single expired lease could be skew or a stall; double the window before
+   * trusting expiry alone. Across hosts, we only have the lease wall-clock
+   * and resume after one period once expired — we never assume foreign
+   * host liveness.
+   */
+  private isSessionLockStale(owner: SessionLockOwner): boolean {
+    const now = this.now();
+    const leaseExpiresAt = owner.leaseExpiresAt;
+    const leaseExpired = leaseExpiresAt > 0 && leaseExpiresAt < now;
+    const doubleLeaseExpired = leaseExpiresAt > 0 && leaseExpiresAt + this.leaseMs < now;
+    const sameHost = !owner.process.hostname || owner.process.hostname === HOSTNAME;
+    // Non-zero startTime lets isAlive distinguish recycled PIDs from the owner.
+    const identityVerifiable = owner.process.pid > 0 && owner.process.startTime > 0;
+
+    if (sameHost) {
+      if (identityVerifiable) {
+        // Verifiably dead with start-time match → immediate. Live owner keeps the lock
+        // even if a renewal ticked late (degrade open on runtime).
+        return !this.isAlive(owner.process);
+      }
+      // Identity unknown: ESRCH means nothing is at that pid → free immediately.
+      // If something answers kill(0), only the 2× lease window can reclaim.
+      if (!this.isAlive(owner.process)) return true;
+      return doubleLeaseExpired;
+    }
+
+    // Cross-host / foreign host: do **not** consult local isAlive (default
+    // treats other hostnames as dead). Reclaim only after one lease period.
+    return leaseExpired;
   }
 
   // ---- Run process records (orphan reconcile) ------------------------------

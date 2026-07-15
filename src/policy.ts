@@ -7,6 +7,7 @@ import type { OutputMode, TaskProfile, TaskSpec } from "./types.js";
 import type { ParallelTaskInput, SubagentParams } from "./schema.js";
 
 export const DEPTH_ENV_VAR = "PI_SUBAGENT_DEPTH";
+export const SPAWNS_ENV_VAR = "PI_SUBAGENT_SPAWNS";
 export const READ_ONLY_TOOLS = new Set([
   "read",
   "grep",
@@ -53,6 +54,8 @@ export type ValidationResult =
       index?: number;
       synthesis?: string;
       tasks: ResolvedTask[];
+      /** True when action:"plan" requested a dry-run — no spawn. */
+      planOnly?: boolean;
     }
   | { ok: false; error: string };
 
@@ -119,6 +122,7 @@ function normalizeTask(
     isolation?: "shared" | "worktree";
     allow_shared_writes?: boolean;
     keep_background?: boolean;
+    include_wip?: boolean;
   },
   index: number,
   parent: ParentContext,
@@ -161,6 +165,12 @@ function normalizeTask(
   }
   if (item.output_schema !== undefined && !isPlausibleSchema(item.output_schema)) {
     return { error: `Task ${index + 1}: output_schema must be a JSON Schema object (type/properties/required)` };
+  }
+  if (item.include_wip === true) {
+    const isolation = item.isolation ?? agent?.isolation ?? "shared";
+    if (isolation !== "worktree") {
+      return { error: `Task ${index + 1}: include_wip requires isolation:"worktree" (dirty-baseline works only on isolated worktrees)` };
+    }
   }
 
   const profile = item.profile ?? agent?.profile ?? defaultProfile;
@@ -205,6 +215,10 @@ function normalizeTask(
       isolation: item.isolation ?? agent?.isolation ?? "shared",
       allowSharedWrites: item.allow_shared_writes === true,
       keepBackground: item.keep_background === true,
+      includeWip: item.include_wip === true,
+      // Child's own future-spawn allowlist never inherits from boot env —
+      // only the named persona's frontmatter `spawns` restricts grandchildren.
+      spawns: agent?.spawns,
       canWrite: resolved.canWrite,
       effectiveTools: resolved.tools,
       resolutionNotes: [
@@ -250,6 +264,42 @@ export function parseDepth(value = process.env[DEPTH_ENV_VAR]): number {
   return Math.min(parsed, 100);
 }
 
+export type SpawnPolicy = { kind: "unrestricted" } | { kind: "disabled" } | { kind: "allowlist"; agents: string[] };
+
+/**
+ * Parse the spawn allowlist env var.
+ * - unset / "*" → unrestricted
+ * - empty / "false" / "off" / "none" → disabled
+ * - "a,b" / "[a, b]" → allowlist (agentless also rejected)
+ * Malformed values fail closed to disabled.
+ */
+export function parseSpawnPolicy(value?: string): SpawnPolicy {
+  if (value === undefined) return { kind: "unrestricted" };
+  // Empty after trim is intentional disable; also treat bare false synonyms.
+  const trimmed = value.trim();
+  if (trimmed === "" || /^false|off|none$/i.test(trimmed)) return { kind: "disabled" };
+  if (trimmed === "*") return { kind: "unrestricted" };
+  // Reject control characters / bad forms before any permissive poke.
+  if (/[\x00-\x1f]/.test(trimmed)) return { kind: "disabled" };
+  const inner = trimmed.startsWith("[") && trimmed.endsWith("]")
+    ? trimmed.slice(1, -1)
+    : trimmed;
+  const agents = inner
+    .split(",")
+    .map((item) => item.trim().replace(/^["']|["']$/g, "").toLowerCase())
+    .filter(Boolean);
+  if (agents.length === 0) return { kind: "disabled" };
+  // Agent names must stay simple identifiers; anything else is a forged policy.
+  if (agents.some((name) => !/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(name))) return { kind: "disabled" };
+  return { kind: "allowlist", agents };
+}
+
+function describeSpawnPolicy(policy: SpawnPolicy): string {
+  if (policy.kind === "disabled") return "spawning disabled";
+  if (policy.kind === "allowlist") return `spawn allowlist: ${policy.agents.join(", ")}`;
+  return "unrestricted";
+}
+
 /** True when this process should avoid spawning further nested subagents. */
 export function shouldRegisterSubagentTool(
   depth = parseDepth(),
@@ -274,18 +324,62 @@ export function validateSubagentRequest(
   const maxDepth = options.maxDepth ?? defaultConfig.maxDepth;
   if (depth >= maxDepth) return { ok: false, error: `Subagent nesting depth limit reached (${depth} >= ${maxDepth})` };
 
+  // Boot spawn policy (from our parent) — fail closed; applies to new spawn modes only.
+  const spawnPolicy = parseSpawnPolicy(process.env[SPAWNS_ENV_VAR]);
+  if (spawnPolicy.kind !== "unrestricted") {
+    const hasSpawnWork = typeof params.task === "string" || Array.isArray(params.tasks);
+    if (hasSpawnWork) {
+      if (spawnPolicy.kind === "disabled") {
+        return { ok: false, error: `Subagent spawning is disabled by parent policy (${describeSpawnPolicy(spawnPolicy)})` };
+      }
+      // Allowlist requires a named agent from the list; agentless is rejected.
+      const requestedAgents: Array<string | undefined> = Array.isArray(params.tasks)
+        ? params.tasks.map((t) => t.agent)
+        : [params.agent];
+      for (let i = 0; i < requestedAgents.length; i++) {
+        const agentName = requestedAgents[i]?.trim().toLowerCase();
+        if (!agentName) {
+          return {
+            ok: false,
+            error: `Task ${i + 1}: agentless tasks are not allowed under parent ${describeSpawnPolicy(spawnPolicy)}`,
+          };
+        }
+        if (!spawnPolicy.agents.includes(agentName)) {
+          return {
+            ok: false,
+            error: `Task ${i + 1}: agent "${agentName}" is not in parent ${describeSpawnPolicy(spawnPolicy)}`,
+          };
+        }
+      }
+    }
+  }
+
   const hasAction = params.action !== undefined;
   const hasTask = typeof params.task === "string";
   const hasTasks = Array.isArray(params.tasks);
-  const modes = [hasAction, hasTask, hasTasks].filter(Boolean).length;
-  if (modes === 0) {
-    return { ok: false, error: "Provide task, tasks, or action (status|wait|cancel)" };
-  }
-  if (modes > 1) {
-    return { ok: false, error: "Provide exactly one of: action, task, or tasks" };
+  const planOnly = params.action === "plan";
+
+  // action:"plan" is a dry-run of spawn modes: it MUST combine with task/tasks.
+  // Other actions remain exclusive with task/tasks.
+  if (planOnly) {
+    if (hasTask === hasTasks) {
+      // Both or neither: plan alone is invalid; task+tasks is also invalid.
+      if (!hasTask && !hasTasks) {
+        return { ok: false, error: "action:\"plan\" requires task or tasks[] (dry-run of a spawn request)" };
+      }
+      return { ok: false, error: "Provide exactly one of: task or tasks" };
+    }
+  } else {
+    const modes = [hasAction, hasTask, hasTasks].filter(Boolean).length;
+    if (modes === 0) {
+      return { ok: false, error: "Provide task, tasks, or action (status|wait|cancel|plan)" };
+    }
+    if (modes > 1) {
+      return { ok: false, error: "Provide exactly one of: action, task, or tasks" };
+    }
   }
 
-  if (hasAction) {
+  if (hasAction && !planOnly) {
     if (params.action !== "status" && !params.id) {
       return { ok: false, error: `${params.action} requires a run id` };
     }
@@ -296,7 +390,8 @@ export function validateSubagentRequest(
     if (params.async !== undefined) {
       return { ok: false, error: "async cannot be combined with action" };
     }
-    return { ok: true, mode: params.action!, async: false, id: params.id, message: params.message, index: params.index, tasks: [] };
+    // `!planOnly` above excludes "plan"; TS cannot narrow the union across the flag.
+    return { ok: true, mode: params.action as ManagementMode, async: false, id: params.id, message: params.message, index: params.index, tasks: [] };
   }
 
   if (hasTasks) {
@@ -326,6 +421,7 @@ export function validateSubagentRequest(
       async: params.async === true,
       synthesis: params.synthesis?.trim() || undefined,
       tasks,
+      planOnly: planOnly || undefined,
     };
   }
 
@@ -335,7 +431,7 @@ export function validateSubagentRequest(
   // Single-task mode: top-level fields form the one task.
   const normalized = normalizeTask(params as ParallelTaskInput, 0, parent, "general", defaults);
   if (normalized.error || !normalized.task) return { ok: false, error: normalized.error ?? "Invalid task" };
-  return { ok: true, mode: "single", async: params.async === true, tasks: [normalized.task] };
+  return { ok: true, mode: "single", async: params.async === true, tasks: [normalized.task], planOnly: planOnly || undefined };
 }
 
 export function describeCapability(task: ResolvedTask): string {

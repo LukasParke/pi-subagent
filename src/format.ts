@@ -106,7 +106,22 @@ export function formatStatusPreview(snapshot: RunSnapshot, now = Date.now()): st
   const elapsed = formatElapsed(snapshot.startedAt, snapshot.endedAt ?? now);
   const phase = snapshot.results.find((r) => r.timeoutPhase)?.timeoutPhase;
   const phaseTag = snapshot.state === 'timeout' && phase ? `/${phase}` : '';
-  return `[${snapshot.id.slice(0, 8)}] ${snapshot.mode} ${formatState(snapshot.state)}${phaseTag} ${elapsed} ${done}`;
+  // Reliability flags from task results (attempt count, stall watchdog).
+  let maxAttempts = 0;
+  let stalledSince: number | undefined;
+  for (const r of snapshot.results) {
+    if (typeof r.attempts === 'number' && r.attempts > maxAttempts) maxAttempts = r.attempts;
+    if (r.stalledSince && isActiveState(r.state)) {
+      stalledSince = stalledSince === undefined ? r.stalledSince : Math.min(stalledSince, r.stalledSince);
+    }
+  }
+  const flags: string[] = [];
+  if (maxAttempts > 1) flags.push(`[attempt ${maxAttempts}]`);
+  if (stalledSince !== undefined && isActiveState(snapshot.state)) {
+    flags.push(`[stalled ${formatDuration(now - stalledSince)}]`);
+  }
+  const flagText = flags.length ? ` ${flags.join(' ')}` : '';
+  return `[${snapshot.id.slice(0, 8)}] ${snapshot.mode} ${formatState(snapshot.state)}${phaseTag} ${elapsed} ${done}${flagText}`;
 }
 
 // ── Inline tool-block rendering ─────────────────────────────────────────────

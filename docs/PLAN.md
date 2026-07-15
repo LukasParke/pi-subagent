@@ -42,7 +42,7 @@ Shipped so far: Phase 1 (structured results) in v0.3.0 — see ROADMAP.md.
 Theme: deepen the named-agent system shipped in 0.2.0 without adding a second
 config surface. All items are additive.
 
-### 2.1 `spawns:` allowlist in agent frontmatter  `[ ]`  (S, high)
+### 2.1 `spawns:` allowlist in agent frontmatter  `[x]`  (S, high)
 
 Per-agent control over which agents a child may spawn — finer than the global
 depth cap, mirroring oh-my-pi's spawn policy.
@@ -91,7 +91,7 @@ depth cap, mirroring oh-my-pi's spawn policy.
 **Tests:** policy unit tests (parse + enforce + fail-closed), agents.ts parse
 tests, one integration test spawning through a restricted persona (fake-pi).
 
-### 2.2 Resumable-session discovery in `status`  `[ ]`  (S)
+### 2.2 Resumable-session discovery in `status`  `[x]`  (S)
 
 **Behavior contract:** bare `status` output lists, for each completed run
 with a session id, a line `  session <id8> (resumable)` under the run
@@ -107,7 +107,7 @@ still listed until evicted.
 
 **Tests:** extend the existing status integration test.
 
-### 2.3 Dry-run validation — `action: "plan"`  `[ ]`  (S)
+### 2.3 Dry-run validation — `action: "plan"`  `[x]`  (S)
 
 **Behavior contract**
 - `{ action: "plan", ...any single/parallel params }` runs full validation +
@@ -138,7 +138,7 @@ reports resolved model/tools per task; nothing is spawned (no run appears in
 **Tests:** policy unit tests for the new mode shape; integration test
 asserting plan output + absence of registry entries.
 
-### 2.4 Agent-file prompt composition — `@file.md` references  `[ ]`  (S)
+### 2.4 Agent-file prompt composition — `@file.md` references  `[x]`  (S)
 
 **Behavior contract:** an agent body line consisting solely of
 `@include relative/path.md` is replaced by that file's contents (relative to
@@ -164,7 +164,7 @@ Theme: close the last known failure modes from the fresh-eyes review and the
 oh-my-pi concurrency lesson. Highest-risk phase; every item starts with a
 failing repro test.
 
-### 3.1 Global-slot granularity for spawn trees  `[ ]`  (M, high)
+### 3.1 Global-slot granularity for spawn trees  `[x]`  (M, high)
 
 **Problem (repro first):** `maxGlobalActive` slots (`src/process-lock.ts`
 `tryAcquireGlobalSlot`, held in `src/runner.ts` for the child's entire run)
@@ -193,7 +193,7 @@ count as depth 0.
 behavior unchanged (16 leaf tasks still run 16-wide); a full-width tree at
 depth 0 + spawning children completes without timeout.
 
-### 3.2 Dirty-baseline worktrees — `include_wip`  `[ ]`  (M)
+### 3.2 Dirty-baseline worktrees — `include_wip`  `[x]`  (M)
 
 **Behavior contract**
 - New task field `include_wip: true` (worktree isolation only; rejected
@@ -220,7 +220,7 @@ the warning.
 **Tests:** worktree unit tests with a dirty repo fixture (staged + unstaged +
 untracked), orchestrator integration test.
 
-### 3.3 Lease-expiry reclaim latency  `[ ]`  (S)
+### 3.3 Lease-expiry reclaim latency  `[x]`  (S)
 
 **Behavior contract:** in `src/process-lock.ts` stale-lock evaluation
 (`acquireSessionLock`), a lock whose owner is *verifiably dead* (same host,
@@ -234,7 +234,7 @@ Document the skew assumption inline.
 **Tests:** table-driven stale-evaluation tests over (host match ×
 identity-verifiable × lease state).
 
-### 3.4 API-consumer orphan documentation  `[ ]`  (S)
+### 3.4 API-consumer orphan documentation  `[x]`  (S)
 
 `runSubagent()` without `locks` + `runId` writes no durable run record, so
 its children are invisible to orphan reclaim. Add a prominent JSDoc warning
@@ -252,7 +252,7 @@ real-Pi E2E for 3.1/3.2 noted in PR · CHANGELOG · tag.
 
 Theme: close the observe→steer loop. UI-only; no engine risk.
 
-### 4.1 Live transcript view in `/subagents`  `[ ]`  (M)
+### 4.1 Live transcript view in `/subagents`  `[x]`  (M)
 
 **Behavior contract**
 - In the overlay detail view of a **running** run, pressing `t` toggles a
@@ -278,7 +278,7 @@ view (observe → steer without leaving the overlay).
 **Tests:** pure tail-helper tests (partial lines, rotation, missing file);
 UI model test for the mode toggle.
 
-### 4.2 Widget/notification config  `[ ]`  (S)
+### 4.2 Widget/notification config  `[x]`  (S)
 
 `SubagentConfig` gains `widget: "background" | "off"` (default `background`)
 and `notifications: "batched" | "off"` (default `batched`), env
@@ -286,7 +286,7 @@ and `notifications: "batched" | "off"` (default `batched`), env
 `refreshWidget` and the `CompletionBatcher` wiring (`src/extension.ts`).
 Config-sanitizer + integration tests for the off states.
 
-### 4.3 Reliability flags in status previews  `[ ]`  (S)
+### 4.3 Reliability flags in status previews  `[x]`  (S)
 
 `formatStatusPreview` (`src/format.ts`) appends `[stalled <dur>]` for active
 runs with `stalledSince` and `[attempt N]` when `attempts > 1`, so background

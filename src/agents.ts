@@ -50,9 +50,17 @@ export interface AgentDefinition {
   isolation?: "shared" | "worktree";
   /** JSON Schema the persona's final result must satisfy (inline JSON or @file.json). */
   outputSchema?: Record<string, unknown>;
+  /**
+   * Which agents this persona may spawn as children.
+   * `false` disables nesting; `"*"` unrestricted; string[] is an allowlist.
+   * Absent means unrestricted (same as `"*"`).
+   */
+  spawns?: false | "*" | string[];
 }
 
 /** Agent names are file-name-safe identifiers; anything else is skipped. */
+
+const MAX_AGENT_FILE_BYTES = 64 * 1024;
 const NAME_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/i;
 
 function agentDir(): string {
@@ -94,18 +102,41 @@ function parseNumber(value: string): number | undefined {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
+/** Frontmatter `spawns:` — false | * | list. Invalid forms degrade to unrestricted (absent). */
+function parseSpawns(value: string): AgentDefinition["spawns"] | undefined {
+  const trimmed = stripQuotes(value.trim());
+  if (!trimmed) return undefined;
+  const lower = trimmed.toLowerCase();
+  if (lower === "false" || lower === "off" || lower === "none") return false;
+  if (trimmed === "*" || lower === "true" || lower === "any") return "*";
+  const list = parseList(trimmed).map((item) => item.toLowerCase()).filter((item) => NAME_PATTERN.test(item));
+  // Non-empty list only; garbage becomes unrestricted (same as absent frontmatter).
+  return list.length > 0 ? list : undefined;
+}
+
+/**
+ * Shared 64KB / regular-file / readable guard for `@path` references.
+ * Symlinks and oversized/missing files return undefined (callers degrade open).
+ */
+function readGuardedRelativeFile(agentFile: string, relativePath: string): string | undefined {
+  if (!relativePath || relativePath.includes("\0")) return undefined;
+  const file = path.resolve(path.dirname(agentFile), relativePath);
+  try {
+    const stat = fs.lstatSync(file);
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.size > MAX_AGENT_FILE_BYTES) return undefined;
+    return fs.readFileSync(file, "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
 /** `output_schema` value: inline single-line JSON, or `@relative/path.json`. */
 function parseSchemaValue(value: string, agentFile: string): Record<string, unknown> | undefined {
   let text = value.trim();
   if (text.startsWith("@")) {
-    const file = path.resolve(path.dirname(agentFile), text.slice(1));
-    try {
-      const stat = fs.lstatSync(file);
-      if (!stat.isFile() || stat.size > 64 * 1024) return undefined;
-      text = fs.readFileSync(file, "utf8");
-    } catch {
-      return undefined;
-    }
+    const loaded = readGuardedRelativeFile(agentFile, text.slice(1));
+    if (loaded === undefined) return undefined;
+    text = loaded;
   }
   try {
     const parsed = JSON.parse(text);
@@ -113,6 +144,21 @@ function parseSchemaValue(value: string, agentFile: string): Record<string, unkn
   } catch {
     return undefined;
   }
+}
+
+/** Expand one-level `@include relative/path.md` body lines; missing/bad refs stay verbatim. */
+function expandIncludes(body: string, agentFile: string): string {
+  const lines = body.split(/\r?\n/);
+  let changed = false;
+  for (let i = 0; i < lines.length; i++) {
+    const match = /^\s*@include\s+(\S+)\s*$/.exec(lines[i]!);
+    if (!match) continue;
+    const loaded = readGuardedRelativeFile(agentFile, match[1]!);
+    if (loaded === undefined) continue;
+    lines[i] = loaded.replace(/\r?\n$/, "");
+    changed = true;
+  }
+  return changed ? lines.join("\n") : body;
 }
 
 export function parseAgentFile(name: string, raw: string, source: string, scope: AgentDefinition["scope"]): AgentDefinition | undefined {
@@ -139,8 +185,10 @@ export function parseAgentFile(name: string, raw: string, source: string, scope:
   const isolation = frontmatter.isolation === "worktree" ? "worktree" as const
     : frontmatter.isolation === "shared" ? "shared" as const
     : undefined;
+  const spawns = frontmatter.spawns !== undefined ? parseSpawns(frontmatter.spawns) : undefined;
 
-  const systemPrompt = body.trim() || undefined;
+  const expanded = expandIncludes(body, source);
+  const systemPrompt = expanded.trim() || undefined;
   const definition: AgentDefinition = {
     name,
     description: stripQuotes(frontmatter.description ?? "").slice(0, 200) || name,
@@ -159,13 +207,12 @@ export function parseAgentFile(name: string, raw: string, source: string, scope:
     maxRetries: frontmatter.max_retries ? parseNumber(frontmatter.max_retries) : undefined,
     isolation,
     outputSchema: frontmatter.output_schema ? parseSchemaValue(frontmatter.output_schema, source) : undefined,
+    spawns,
   };
   return definition;
 }
 
 // ── Discovery ────────────────────────────────────────────────────────────────
-
-const MAX_AGENT_FILE_BYTES = 64 * 1024;
 
 /**
  * Discover agent definitions across the conventional roots. Synchronous by

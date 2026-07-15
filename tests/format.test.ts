@@ -141,4 +141,94 @@ describe('format helpers', () => {
     expect(preview).toContain('parallel');
     expect(preview).not.toContain('full summary'); // metadata/preview
   });
+
+  it('status preview shows stalled duration for active runs only', () => {
+    const now = 1_000_000;
+    const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } as UsageStats;
+    const base = {
+      schemaVersion: 1 as const,
+      id: 'runstall1xxxx',
+      sessionKey: 'key',
+      mode: 'single' as const,
+      startedAt: now - 120_000,
+      taskPreviews: [] as string[],
+      delivered: false,
+    };
+    const stalledSince = now - 125_000;
+    const running: RunSnapshot = {
+      ...base,
+      state: 'running' as RunState,
+      results: [{
+        label: 't',
+        task: 'x',
+        state: 'running' as RunState,
+        exitCode: null,
+        usage,
+        stalledSince,
+      }],
+    };
+    const preview = format.formatStatusPreview(running, now);
+    expect(preview).toContain('[stalled 2m5s]');
+    expect(preview.split('\n')).toHaveLength(1);
+
+    const finished: RunSnapshot = {
+      ...base,
+      state: 'failed' as RunState,
+      endedAt: now,
+      results: [{
+        label: 't',
+        task: 'x',
+        state: 'failed' as RunState,
+        exitCode: 1,
+        usage,
+        stalledSince,
+      }],
+    };
+    expect(format.formatStatusPreview(finished, now)).not.toMatch(/\[stalled /);
+  });
+
+  it('status preview shows attempt flag only when attempts > 1', () => {
+    const now = 1_000_000;
+    const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } as UsageStats;
+    const mk = (attempts?: number): RunSnapshot => ({
+      schemaVersion: 1 as const,
+      id: 'runretry0xxxx',
+      sessionKey: 'key',
+      mode: 'single' as const,
+      state: 'running' as RunState,
+      startedAt: now - 30_000,
+      taskPreviews: [],
+      delivered: false,
+      results: [{
+        label: 't',
+        task: 'x',
+        state: 'running' as RunState,
+        exitCode: null,
+        usage,
+        attempts,
+      }],
+    });
+    expect(format.formatStatusPreview(mk(1), now)).not.toMatch(/\[attempt /);
+    expect(format.formatStatusPreview(mk(undefined), now)).not.toMatch(/\[attempt /);
+    const withRetry = format.formatStatusPreview(mk(2), now);
+    expect(withRetry).toContain('[attempt 2]');
+    expect(withRetry.split('\n')).toHaveLength(1);
+  });
+
+  it('status preview plain case unchanged without reliability flags', () => {
+    const snap: RunSnapshot = {
+      schemaVersion: 1 as const,
+      id: 'plain000xxxx',
+      sessionKey: 'key',
+      mode: 'parallel' as const,
+      state: 'running' as RunState,
+      startedAt: 1000,
+      taskPreviews: [],
+      delivered: false,
+      results: [],
+    };
+    expect(format.formatStatusPreview(snap, 1000 + 45_000)).toBe(
+      '[plain000] parallel running 45s ready',
+    );
+  });
 });

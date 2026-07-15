@@ -1,4 +1,7 @@
 import { Buffer } from "node:buffer";
+import * as fs from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext, Theme, ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import { Value } from "typebox/value";
@@ -19,7 +22,7 @@ import { createGetPiCommand, getLaunchResolution } from "./launch.js";
 import { abortAsPromise, sweepSessionDir } from "./maintenance.js";
 import { runTasks } from "./orchestrator.js";
 import { OutputManager } from "./output.js";
-import { parseDepth, validateSubagentRequest, type ResolvedTask } from "./policy.js";
+import { parseDepth, parseSpawnPolicy, SPAWNS_ENV_VAR, validateSubagentRequest, type ResolvedTask } from "./policy.js";
 import type { ChildRunner } from "./runner.js";
 import { ProcessLockManager } from "./process-lock.js";
 import { SessionScopedRunRegistry, snapshotFromLiveRun } from "./registry.js";
@@ -28,6 +31,7 @@ import { Semaphore } from "./semaphore.js";
 import type { RunSnapshot, TaskResult, TaskSpec } from "./types.js";
 import { emptyUsage } from "./types.js";
 import { buildUsageLedger, formatLedger, type UsageLedger } from "./usage.js";
+import { resolveSessionFilePath } from "./transcript.js";
 import { CompletionBatcher, COMPLETION_MESSAGE_TYPE, type CompletionDetails, type CompletionDetailsRun } from "./notifications.js";
 import { describeCatalog, discoverAgents, type AgentDefinition } from "./agents.js";
 import { createSubagentsOverlay, FooterStatusModel, type SubagentAdapter } from "./ui.js";
@@ -174,6 +178,12 @@ function makeAdapter(runtime: SessionRuntime): SubagentAdapter {
     notify(message, level = "info") {
       runtime.ctx.ui.notify(message, level === "warn" ? "warning" : level);
     },
+    getSessionFilePath(id) {
+      const run = this.getRunById(id);
+      const sessionId = run?.results.find((result) => result.sessionId)?.sessionId;
+      if (!sessionId) return undefined;
+      return resolveSessionFilePath(runtime.config.sessionDir, sessionId);
+    },
   };
 }
 
@@ -194,6 +204,14 @@ function refreshFooter(runtime: SessionRuntime): void {
  */
 function refreshWidget(runtime: SessionRuntime): void {
   if (runtime.closed || !runtime.ctx.hasUI) return;
+  if (runtime.config.widget === "off") {
+    runtime.ctx.ui.setWidget("subagent", undefined);
+    if (runtime.widgetTimer) {
+      clearInterval(runtime.widgetTimer);
+      runtime.widgetTimer = undefined;
+    }
+    return;
+  }
   const theme = runtime.ctx.ui.theme;
   const live = runtime.registry.getLiveRuns(runtime.key).filter((run) => runtime.asyncRuns.has(run.id));
   if (!live.length) {
@@ -332,6 +350,94 @@ function fail(message: string): never {
   throw new Error(message);
 }
 
+/** Status lines advertising resumable child session ids under a finished run. */
+function resumableSessionLines(
+  snapshot: { state?: RunSnapshot["state"]; results: Array<{ sessionId?: string }> },
+  full: boolean,
+): string[] {
+  if (snapshot.state && isActiveState(snapshot.state)) return [];
+  const lines: string[] = [];
+  for (const result of snapshot.results) {
+    if (!result.sessionId) continue;
+    lines.push(full ? `  session ${result.sessionId}` : `  session ${result.sessionId.slice(0, 8)} (resumable)`);
+  }
+  return lines;
+}
+
+async function runPlanPreflights(
+  runtime: SessionRuntime,
+  tasks: ResolvedTask[],
+  parentCwd: string,
+): Promise<void> {
+  for (let index = 0; index < tasks.length; index++) {
+    const task = tasks[index]!;
+    const taskCwd = task.cwd ?? parentCwd;
+    if (task.isolation === "worktree") {
+      if (!(await runtime.worktrees.isGitRepo(taskCwd))) {
+        fail(`Task ${index + 1}: ${taskCwd} is not a git repository`);
+      }
+    }
+    if (task.contextFork) {
+      const sessionFile = task.parentSessionFile;
+      if (!sessionFile) fail(`Task ${index + 1}: context:'fork' requires a persisted parent session file`);
+      await fs.access(sessionFile).catch(() => {
+        fail(`context:'fork' failed: parent session file ${sessionFile} is not readable.`);
+      });
+    }
+    if (task.output) {
+      const parentDir = path.dirname(task.output);
+      const stat = await fs.stat(parentDir).catch(() => undefined);
+      if (!stat?.isDirectory()) fail(`Task ${index + 1}: output parent directory does not exist: ${parentDir}`);
+      await fs.access(parentDir, fsConstants.W_OK).catch(() => {
+        fail(`Task ${index + 1}: output parent directory is not writable: ${parentDir}`);
+      });
+    }
+  }
+}
+
+function formatPlanEntry(task: ResolvedTask, index: number) {
+  const agentNote = task.resolutionNotes.find((note) => note.startsWith("agent="));
+  const agent = agentNote?.slice("agent=".length);
+  return {
+    index,
+    label: task.label,
+    agent,
+    model: task.model,
+    thinking: task.thinking,
+    profile: task.profile,
+    access: task.canWrite ? "RW" : "RO" as const,
+    tools: task.effectiveTools,
+    budgets: {
+      timeoutMs: task.timeoutMs,
+      maxTurns: task.maxTurns,
+      maxCost: task.maxCost,
+      graceTurns: task.graceTurns,
+    },
+    isolation: task.isolation ?? "shared",
+    resolutionNotes: task.resolutionNotes,
+  };
+}
+
+function formatPlanText(mode: "single" | "parallel", plan: ReturnType<typeof formatPlanEntry>[]): string {
+  const header = `Plan (dry-run, nothing spawned) — ${mode}, ${plan.length} task${plan.length === 1 ? "" : "s"}:`;
+  const body = plan.map((entry) => {
+    const budgets = [
+      `timeout_ms=${entry.budgets.timeoutMs}`,
+      entry.budgets.maxTurns !== undefined ? `max_turns=${entry.budgets.maxTurns}` : undefined,
+      entry.budgets.maxCost !== undefined ? `max_cost=${entry.budgets.maxCost}` : undefined,
+      entry.budgets.graceTurns !== undefined ? `grace_turns=${entry.budgets.graceTurns}` : undefined,
+    ].filter(Boolean).join(" ");
+    return [
+      `${entry.index + 1}. ${entry.label}${entry.agent ? ` [agent:${entry.agent}]` : ""} (${entry.profile}/${entry.access})`,
+      `   model=${entry.model ?? "(default)"} thinking=${entry.thinking ?? "(default)"} isolation=${entry.isolation}`,
+      `   tools=[${entry.tools.join(",")}]`,
+      `   ${budgets}`,
+      `   notes: ${entry.resolutionNotes.join(", ")}`,
+    ].join("\n");
+  });
+  return [header, ...body].join("\n");
+}
+
 /** Re-read agent files at most every few seconds; they can change mid-session. */
 function agentCatalog(runtime: SessionRuntime): Map<string, AgentDefinition> {
   const now = Date.now();
@@ -363,7 +469,7 @@ function guidelines(catalog?: Map<string, AgentDefinition>): string[] {
     "For parallel research, add synthesis:'<instruction>' to have one read-only child fold all outputs into a single brief, delivered first.",
     "Use output_schema (JSON Schema) when you need a machine-readable result: the child must end with a validated json:result block, invalid output gets one automatic repair round, and delivery is the clean JSON. Compose downstream steps from details.results[].structuredOutput.",
     "Use output_mode:'file-only' for large reports; the parent gets a pointer instead of inline text.",
-    "resume:'<child session id>' continues a finished child with context intact; fork_resume:true branches it instead.",
+    "Discover finished child session ids from action:'status' (listed as session <id8> (resumable)), then continue with resume: \"<session id>\"; fork_resume:true branches it instead.",
   ];
 }
 
@@ -509,6 +615,9 @@ export default function registerSubagent(pi: ExtensionAPI): void {
   // config maxDepth are the real limit (file-configured caps need session_start).
   const bootDepth = parseDepth();
   if (bootDepth >= 100) return;
+  // Parent set spawns:false (or a malformed PI_SUBAGENT_SPAWNS) — no tool surface
+  // for further nesting. Accidental-recursion guard only; not a security boundary.
+  if (parseSpawnPolicy(process.env[SPAWNS_ENV_VAR]).kind === "disabled") return;
 
   async function teardown(runtime: SessionRuntime): Promise<void> {
     if (runtime.closed) return;
@@ -559,29 +668,33 @@ export default function registerSubagent(pi: ExtensionAPI): void {
     });
     // Background-run completion notifications: batched followUp messages so
     // the parent LLM reacts without polling. Foreground runs deliver inline.
-    runtime.completions = new CompletionBatcher((runIds) => {
-      if (current !== runtime || runtime.closed) return;
-      // Delivered-state is re-checked at flush time: a wait that consumed the
-      // run during the batching window suppresses the redundant notification.
-      const undelivered = runIds.filter((id) => {
-        const found = runtime.registry.lookup(id, runtime.key);
-        return found.status === "found" && !!found.run && !found.run.delivered;
+    // `notifications: "off"` skips construction; subscribe still uses optional chain.
+    if (runtime.config.notifications !== "off") {
+      runtime.completions = new CompletionBatcher((runIds) => {
+        if (current !== runtime || runtime.closed) return;
+        // Delivered-state is re-checked at flush time: a wait that consumed the
+        // run during the batching window suppresses the redundant notification.
+        const undelivered = runIds.filter((id) => {
+          const found = runtime.registry.lookup(id, runtime.key);
+          return found.status === "found" && !!found.run && !found.run.delivered;
+        });
+        const details = buildCompletionDetails(runtime, undelivered);
+        if (!details.runs.length) return;
+        const lines = details.runs.map((run) =>
+          `- [${run.id.slice(0, 8)}] ${run.label}: ${run.state}${run.preview ? ` — ${run.preview}` : ""}${run.pointers.length ? ` (${run.pointers.join(", ")})` : ""}`);
+        pi.sendMessage({
+          customType: COMPLETION_MESSAGE_TYPE,
+          content: [
+            `${details.runs.length === 1 ? "A background subagent run" : `${details.runs.length} background subagent runs`} finished:`,
+            ...lines,
+            `Use { action: "wait", id } to collect full output, or dismiss with status if not needed.`,
+          ].join("\n"),
+          display: true,
+          details,
+        }, { deliverAs: "followUp", triggerTurn: true });
       });
-      const details = buildCompletionDetails(runtime, undelivered);
-      if (!details.runs.length) return;
-      const lines = details.runs.map((run) =>
-        `- [${run.id.slice(0, 8)}] ${run.label}: ${run.state}${run.preview ? ` — ${run.preview}` : ""}${run.pointers.length ? ` (${run.pointers.join(", ")})` : ""}`);
-      pi.sendMessage({
-        customType: COMPLETION_MESSAGE_TYPE,
-        content: [
-          `${details.runs.length === 1 ? "A background subagent run" : `${details.runs.length} background subagent runs`} finished:`,
-          ...lines,
-          `Use { action: "wait", id } to collect full output, or dismiss with status if not needed.`,
-        ].join("\n"),
-        display: true,
-        details,
-      }, { deliverAs: "followUp", triggerTurn: true });
-    });
+    }
+
     runtime.unsubscribe = runtime.registry.subscribe((event) => {
       if (event.sessionKey !== runtime.key) return;
       if (event.type === "terminal" && runtime.asyncRuns.has(event.runId)) {
@@ -741,7 +854,9 @@ export default function registerSubagent(pi: ExtensionAPI): void {
             ? `Named agents (use agent:'<name>'):\n${describeCatalog(catalog).map((line) => `- ${line}`).join("\n")}`
             : "";
           const text = [
-            runs.length ? runs.map((run) => formatStatusPreview(run)).join("\n") : "No subagent runs.",
+            runs.length
+              ? runs.map((run) => [formatStatusPreview(run), ...resumableSessionLines(run, false)].join("\n")).join("\n")
+              : "No subagent runs.",
             agentSection,
             formatLedger(ledger(runtime)),
           ].filter(Boolean).join("\n\n");
@@ -752,7 +867,12 @@ export default function registerSubagent(pi: ExtensionAPI): void {
         if (found.status !== "found" || !found.run) fail(`Run ${validated.id} was not found in this session.`);
         const snapshot = "controller" in found.run ? snapshotFromLiveRun(found.run) : found.run;
         if (validated.mode === "status") {
-          return { content: [{ type: "text", text: `${formatStatusPreview(snapshot)}\n${formatLedger(ledger(runtime))}` }], details: details(snapshot.mode, snapshot.results, snapshot) };
+          const text = [
+            formatStatusPreview(snapshot),
+            ...resumableSessionLines(snapshot, true),
+            formatLedger(ledger(runtime)),
+          ].filter(Boolean).join("\n");
+          return { content: [{ type: "text", text }], details: details(snapshot.mode, snapshot.results, snapshot) };
         }
         if (validated.mode === "cancel") {
           if ("controller" in found.run) found.run.controller.abort();
@@ -839,6 +959,16 @@ export default function registerSubagent(pi: ExtensionAPI): void {
         return { content: [{ type: "text", text }], details: details(terminal.mode, delivered.cappedResults as any, terminal) };
       }
 
+      if (validated.planOnly) {
+        await runPlanPreflights(runtime, validated.tasks, ctx.cwd);
+        const plan = validated.tasks.map((task, index) => formatPlanEntry(task, index));
+        const mode = validated.mode as "single" | "parallel";
+        return {
+          content: [{ type: "text", text: formatPlanText(mode, plan) }],
+          details: { mode, plan },
+        };
+      }
+
       const specs: TaskSpec[] = validated.tasks.map((task: ResolvedTask) => ({
         task: task.task,
         label: task.label,
@@ -865,6 +995,7 @@ export default function registerSubagent(pi: ExtensionAPI): void {
         maxRetries: task.maxRetries,
         contextFork: task.contextFork,
         parentSessionFile: task.parentSessionFile,
+        spawns: task.spawns,
       }));
       const runId = runtime.registry.allocateRunId();
       const directResumes = validated.tasks.filter((task) => task.resume && !task.forkResume).map((task) => task.resume!);

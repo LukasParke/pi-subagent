@@ -24,6 +24,10 @@ Parallel mode defaults to `explore` to avoid concurrent shared writes.
    not re-register the subagent tool. Depth is scheduling metadata — `bash` or an
    env-scrubbing wrapper can still invoke `pi` directly, so treat it as an
    accidental-recursion guard, not a security boundary.
+   **Spawn allowlists** (`spawns:` in agent frontmatter, env `PI_SUBAGENT_SPAWNS`)
+   refine that same guard: a child may be limited to named personas, or to none
+   (tool not registered). Like depth, this is not a sandbox — children can still
+   shell out to `pi`.
 4. **Process caps** limit concurrency both per parent session (`maxActiveProcesses`)
    and machine-wide (`maxGlobalActive`, default 16).
 5. **Transcripts** under `~/.pi/subagent-sessions` may contain task content, tool

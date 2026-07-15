@@ -75,6 +75,11 @@ Publishing is automated from `v*` tags — see [docs/RELEASING.md](./docs/RELEAS
 { action: "wait", id: "abc123" }      // interruptible; does not cancel
 { action: "cancel", id: "abc123" }
 
+// Dry-run a spawn request: full validation + preflights (git repo, fork
+// session, output paths), returns the resolved per-task plan (model, tools,
+// budgets, isolation) without spawning anything.
+{ action: "plan", tasks: [{ task: "Implement feature A", isolation: "worktree" }] }
+
 // Structured output: the child must end with a fenced json:result block
 // matching the schema. Invalid output gets one automatic repair round;
 // delivery is the clean JSON and details carry the parsed object.
@@ -164,6 +169,8 @@ Defaults can be overridden in `~/.pi/subagent.json` and per-field via env vars
 | `stallAfterMs` | `PI_SUBAGENT_STALL_AFTER_MS` | 90000 |
 | `stallKillAfterMs` | `PI_SUBAGENT_STALL_KILL_AFTER_MS` | 90000 |
 | `maxRetries` | `PI_SUBAGENT_MAX_RETRIES` | 1 |
+| `widget` | `PI_SUBAGENT_WIDGET` | `background` (`off` disables) |
+| `notifications` | `PI_SUBAGENT_NOTIFICATIONS` | `batched` (`off` disables) |
 | (bin) | `PI_SUBAGENT_BIN` | auto (`process.execPath` + CLI entry) |
 
 ### Named agent files
@@ -188,16 +195,30 @@ thinking: high
 profile: review
 max_turns: 20
 fallback_models: [openrouter/backup-model]
+spawns: false          # or "*", "scout", "[reviewer, scout]"
 ---
 
 You are a security auditor. Review code for injection flaws, auth issues,
 and sensitive data exposure. Report findings with file:line evidence and
 severity ratings.
+
+@include shared/review-checklist.md
 ```
 
 Agent files may also pin a structured contract with
 `output_schema: {"type": "object", …}` (single-line inline JSON) or
 `output_schema: @contract.json` (path relative to the agent file).
+
+`spawns:` controls which agents a child of this persona may spawn:
+`false` disables further nesting (no tool registered in that child),
+`"*"` (or omit) is unrestricted, and a comma/bracket list is an allowlist
+(agentless tasks are rejected under an allowlist). The policy is passed to
+the child via `PI_SUBAGENT_SPAWNS` and enforced on each subsequent spawn.
+
+Body lines that consist solely of `@include relative/path.md` expand that
+file one level deep (relative to the agent file, same 64KB/symlink guards
+as `@contract.json`). Missing or rejected includes leave the line verbatim;
+includes do not recurse.
 
 Invoke with `{ task: "…", agent: "reviewer" }`. Precedence per field:
 **explicit request params > agent file > per-profile `taskDefaults` > parent
@@ -279,6 +300,20 @@ Notes on behavior:
   after `worktreeRetentionDays`. Live runs are never swept.
 - `keep_background: true` on a task keeps processes the child intentionally
   backgrounded (e.g. dev servers) alive after a clean exit.
+- `include_wip: true` (with `isolation: "worktree"`) seeds the worktree with the
+  parent checkout's uncommitted changes so the child sees your dirty baseline.
+  `diff`/`apply` subtract that baseline when clean, else report the combined
+  delta with an explicit `[includes parent WIP]` warning.
+
+## Using the runner as a library
+
+`runSubagent()` can be called directly without the extension host, but durable
+coordination is **opt-in**. Pass both `locks` (a `ProcessLockManager`) and a
+stable `runId` if you want global concurrency slots and orphan reclaim to see
+the child. Without those options no durable run record is written, so a parent
+restart cannot reclassify the process and nested children vanish from reconcile.
+There is intentionally no implicit default lock manager — embedding code that
+needs durability must construct and share one.
 
 ## Design invariants
 

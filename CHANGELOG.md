@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased
+
+### Agent ecosystem (PLAN phase 2)
+
+- **`spawns:` allowlist** in agent frontmatter (`false` / `"*"` / name list):
+  controls which agents a persona's children may spawn. The policy travels via
+  `PI_SUBAGENT_SPAWNS`; `spawns: false` children don't register the subagent
+  tool at all. Malformed env fails closed to disabled. Accidental-recursion
+  guard, not a security boundary (documented in SECURITY.md).
+- **`@include relative/path.md`** in agent bodies: one-level prompt
+  composition with the same 64KB/symlink guards as `@contract.json`;
+  missing/rejected includes stay verbatim.
+- **Resumable-session discovery**: bare `status` lists `session <id8>
+  (resumable)` under completed runs; run-specific `status` shows full ids, and
+  the prompt guidelines mention `resume:`.
+- **`action: "plan"`** dry-run: full validation plus worktree/fork/output
+  preflights, returning the resolved per-task plan (model, tools, budgets,
+  isolation, notes) without spawning — same errors as the real call.
+
+### Engine hardening (PLAN phase 3)
+
+- **Depth-tiered global slots**: slot records carry `depth` and shallow tiers
+  reserve capacity for deeper ones, so a spawn tree wider than
+  `maxGlobalActive` can no longer deadlock while parents wait on children.
+  Old slot files without `depth` count as depth 0.
+- **`include_wip: true`** (worktree isolation only): seeds the worktree with
+  the parent checkout's uncommitted changes. `diff`/`apply` subtract the WIP
+  patch when clean, else report the combined delta with an explicit
+  `[includes parent WIP]` warning; an untouched WIP-only worktree counts as
+  unchanged and is cleaned up.
+- **Faster stale-lock reclaim**: a lease-expired cross-host (or unverifiable
+  foreign) owner is reclaimable after one lease period; the 2× window remains
+  only where clock skew is plausible (same host, identity unknown).
+- **Library-use warning**: `runSubagent()` without `locks` + `runId` writes no
+  durable run record (children invisible to orphan reclaim) — now documented
+  loudly in JSDoc and README.
+
+### Observability (PLAN phase 4)
+
+- **Live transcript view**: in `/subagents`, `t` on a running run tails the
+  child's session file (500ms poll, auto-follow, scroll-up pauses); `s` steer
+  works from the same view.
+- **`widget: "off"` / `notifications: "off"`** config keys (env
+  `PI_SUBAGENT_WIDGET` / `PI_SUBAGENT_NOTIFICATIONS`) for quiet mode.
+- Status previews append `[stalled <dur>]` and `[attempt N]` so background
+  polling surfaces watchdog/retry state without the overlay.
+
 ## 0.3.1
 
 - Remove `publishConfig.provenance` (it blocked the one-time local bootstrap

@@ -7,7 +7,7 @@ import { emptyUsage } from "./types.js";
 import { ProtocolParser, type ProtocolUpdate } from "./protocol.js";
 import { Semaphore } from "./semaphore.js";
 import { defaultConfig } from "./config.js";
-import { DEPTH_ENV_VAR } from "./policy.js";
+import { DEPTH_ENV_VAR, SPAWNS_ENV_VAR, parseDepth } from "./policy.js";
 import {
   processStartTime,
   type ProcessLockManager,
@@ -24,9 +24,16 @@ export interface RunnerOptions {
   sessionDir?: string;
   onCheckpoint?: (result: Partial<TaskResult>) => void;
   killGraceMs?: number;
-  /** Optional durable coordinator for global slots + run process records. */
+  /**
+   * Optional durable coordinator for global slots + run process records.
+   *
+   * **Library consumers:** without `locks` + `runId`, no durable run record is
+   * written and the child is invisible to orphan reclaim on parent restart.
+   * There is intentionally **no** implicit default lock manager (opt in when
+   * you need durability; magic global state is worse).
+   */
   locks?: ProcessLockManager;
-  /** Run id for durable identity (orphan reconcile). */
+  /** Run id for durable identity (orphan reconcile). Required with `locks` for reclaim. */
   runId?: string;
   /** Parent session key for durable identity. */
   parentSessionKey?: string;
@@ -393,10 +400,12 @@ export class ChildRunner {
       }
 
       // Global cap (if configured) is checked before the per-session semaphore so
-      // a saturated machine rejects early with a clear message.
+      // a saturated machine rejects early with a clear message. Depth is the
+      // parent process nest level (PI_SUBAGENT_DEPTH via parseDepth): shallow tiers
+      // reserve capacity so nested spawns cannot deadlock on a full pool.
       if (this.locks) {
         try {
-          globalSlot = this.locks.tryAcquireGlobalSlot(this.runId ?? "anonymous");
+          globalSlot = this.locks.tryAcquireGlobalSlot(this.runId ?? "anonymous", parseDepth());
         } catch (error: any) {
           result.state = "failed";
           result.stopReason = "global_limit";
@@ -468,9 +477,18 @@ export class ChildRunner {
       const depth = Number.parseInt(process.env[DEPTH_ENV_VAR] ?? "0", 10) || 0;
       // Pin the launch identity + depth in env. Children re-register only when
       // depth leaves remaining headroom (enforced in extension + policy too).
+      // Encode the child's own spawn allowlist so grandchildren validate against it.
+      const spawnEnv = spec.spawns === false
+        ? ""
+        : Array.isArray(spec.spawns)
+          ? spec.spawns.join(",")
+          : spec.spawns === "*"
+            ? "*"
+            : undefined;
       const childEnv: NodeJS.ProcessEnv = {
         ...process.env,
         [DEPTH_ENV_VAR]: String(depth + 1),
+        ...(spawnEnv !== undefined ? { [SPAWNS_ENV_VAR]: spawnEnv } : {}),
       };
 
       processHandle = spawn(invocation.command, invocation.args, {
@@ -669,6 +687,14 @@ export class ChildRunner {
   }
 }
 
+/**
+ * Run a single subagent child process.
+ *
+ * **Orphan reclaim:** without `options.locks` **and** `options.runId`, no durable
+ * run record is written under the lock root, so children are invisible to
+ * startup orphan reclaim. Pass both when embedding the runner as a library if you
+ * need crash recovery. No implicit default lock manager is created (opt-in only).
+ */
 export function runSubagent(spec: TaskSpec, options: RunnerOptions & { signal?: AbortSignal } = {}): Promise<TaskResult> {
   return new ChildRunner(
     options.semaphore,

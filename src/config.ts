@@ -6,6 +6,11 @@ import type { TaskProfile } from "./types.js";
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
+const WIDGET_MODES = ["background", "off"] as const;
+export type WidgetMode = (typeof WIDGET_MODES)[number];
+const NOTIFICATION_MODES = ["batched", "off"] as const;
+export type NotificationMode = (typeof NOTIFICATION_MODES)[number];
+
 /**
  * Per-profile defaults applied when a task omits the field. Explicit request
  * values always win; profile defaults beat parent-session inheritance for
@@ -67,6 +72,16 @@ export interface SubagentConfig {
   stallKillAfterMs: number;
   /** Default extra attempts on transient failures (queued timeout, stall, provider error). */
   maxRetries: number;
+  /**
+   * Ambient background-run widget above the editor. `"off"` clears any existing
+   * widget and skips refreshes.
+   */
+  widget: WidgetMode;
+  /**
+   * Batched completion followUp messages for async runs. `"off"` disables the
+   * CompletionBatcher so the parent is not notified on finish.
+   */
+  notifications: NotificationMode;
 }
 
 export const defaultConfig: SubagentConfig = {
@@ -90,6 +105,8 @@ export const defaultConfig: SubagentConfig = {
   stallAfterMs: 90_000,
   stallKillAfterMs: 90_000,
   maxRetries: 1,
+  widget: "background",
+  notifications: "batched",
 };
 
 /** User-facing config file. Env vars override file values; both override defaults. */
@@ -102,6 +119,12 @@ function positiveNumber(value: unknown, min = 1): number | undefined {
 
 function nonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function oneOf<T extends readonly string[]>(allowed: T, value: unknown): T[number] | undefined {
+  return typeof value === "string" && (allowed as readonly string[]).includes(value)
+    ? (value as T[number])
+    : undefined;
 }
 
 function prune<T extends object>(value: Partial<T>): Partial<T> {
@@ -167,6 +190,8 @@ export function sanitizeConfigOverrides(raw: unknown): Partial<SubagentConfig> {
     stallAfterMs: positiveNumber(value.stallAfterMs, 0),
     stallKillAfterMs: positiveNumber(value.stallKillAfterMs, 0),
     maxRetries: positiveNumber(value.maxRetries, 0),
+    widget: oneOf(WIDGET_MODES, value.widget),
+    notifications: oneOf(NOTIFICATION_MODES, value.notifications),
   });
 }
 
@@ -189,6 +214,8 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Partial<Sub
     stallAfterMs: positiveNumber(env.PI_SUBAGENT_STALL_AFTER_MS, 0),
     stallKillAfterMs: positiveNumber(env.PI_SUBAGENT_STALL_KILL_AFTER_MS, 0),
     maxRetries: positiveNumber(env.PI_SUBAGENT_MAX_RETRIES, 0),
+    widget: oneOf(WIDGET_MODES, env.PI_SUBAGENT_WIDGET),
+    notifications: oneOf(NOTIFICATION_MODES, env.PI_SUBAGENT_NOTIFICATIONS),
   });
 }
 

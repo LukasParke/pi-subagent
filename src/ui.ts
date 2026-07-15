@@ -13,6 +13,7 @@ import {
   SPINNERS,
   stateGlyph,
 } from "./format.js";
+import { tailSessionFile, type TailSessionStatus } from "./transcript.js";
 
 export interface SubagentAdapter {
   getActiveRuns(): RunSnapshot[];
@@ -32,10 +33,13 @@ export interface SubagentAdapter {
   applyWorktree?(id: string): Promise<void>;
   /** Confirm and discard a finished run's worktree + branch. */
   discardWorktree?(id: string): Promise<void>;
+  /** Resolve child session .jsonl path for a run (for live transcript tail). */
+  getSessionFilePath?(id: string): string | undefined;
+
 }
 
 export interface UIAction {
-  type: "cancel" | "dismiss" | "resume" | "output" | "close" | "select";
+  type: "cancel" | "dismiss" | "resume" | "output" | "close" | "select" | "transcript" | "steer";
   id?: string;
 }
 
@@ -117,6 +121,13 @@ export class SubagentsOverlay implements Component {
   private timer?: NodeJS.Timeout;
   private unsubscribe?: () => void;
   private disposed = false;
+  /** Live child-session tail visible in the running-run detail view. */
+  private liveTranscript = false;
+  /** Auto-follow the tail unless the user has scrolled up. */
+  private transcriptFollow = true;
+  private transcriptLines: string[] = [];
+  private transcriptStatus: TailSessionStatus | "unset" = "unset";
+  private transcriptPoll?: NodeJS.Timeout;
 
   constructor(
     private readonly tui: TUI,
@@ -157,6 +168,73 @@ export class SubagentsOverlay implements Component {
     this.timer = undefined;
   }
 
+  private stopTranscriptPoll(): void {
+    if (this.transcriptPoll) clearInterval(this.transcriptPoll);
+    this.transcriptPoll = undefined;
+  }
+
+  private exitLiveTranscript(): void {
+    this.liveTranscript = false;
+    this.transcriptFollow = true;
+    this.transcriptLines = [];
+    this.transcriptStatus = "unset";
+    this.stopTranscriptPoll();
+  }
+
+  private refreshTranscript(): void {
+    if (this.disposed || !this.liveTranscript || !this.detailId) return;
+    const run = this.adapter.getRunById(this.detailId);
+    if (!run || !isActiveState(run.state)) {
+      // Finished/gone: drop live mode so the normal checkpointed detail shows.
+      this.exitLiveTranscript();
+      return;
+    }
+    const path = this.adapter.getSessionFilePath?.(run.id);
+    if (!path) {
+      this.transcriptStatus = "missing";
+      this.transcriptLines = [];
+      return;
+    }
+    const result = tailSessionFile(path);
+    this.transcriptStatus = result.status;
+    this.transcriptLines = result.lines;
+  }
+
+  private syncTranscriptPoll(): void {
+    const want =
+      !this.disposed &&
+      this.liveTranscript &&
+      !!this.detailId &&
+      (() => {
+        const run = this.adapter.getRunById(this.detailId!);
+        return !!run && isActiveState(run.state);
+      })();
+    if (!want) {
+      this.stopTranscriptPoll();
+      return;
+    }
+    if (this.transcriptPoll) return;
+    this.refreshTranscript();
+    this.transcriptPoll = setInterval(() => {
+      if (this.disposed) {
+        this.stopTranscriptPoll();
+        return;
+      }
+      this.refreshTranscript();
+      if (this.liveTranscript && this.transcriptFollow) {
+        // Keep the viewport glued to the newest lines while following.
+        this.scroll = Number.MAX_SAFE_INTEGER;
+      }
+      if (!this.liveTranscript) {
+        this.stopTranscriptPoll();
+        return;
+      }
+      this.invalidate();
+      this.tui.requestRender();
+    }, 500);
+    this.transcriptPoll.unref?.();
+  }
+
   private handleAction(data: string, run: RunSnapshot | null): void {
     if (!run) return;
     if (data === "c" && isActiveState(run.state)) this.adapter.cancelRun(run.id);
@@ -172,14 +250,34 @@ export class SubagentsOverlay implements Component {
   handleInput(data: string): void {
     const runs = this.runs();
     if (this.detailId) {
+      const detailRun = this.adapter.getRunById(this.detailId);
       if (matchesKey(data, "escape") || matchesKey(data, "backspace") || data === "b") {
+        this.exitLiveTranscript();
         this.detailId = undefined;
         this.scroll = 0;
-      } else if (matchesKey(data, "down") || data === "j") this.scroll++;
-      else if (matchesKey(data, "up") || data === "k") this.scroll = Math.max(0, this.scroll - 1);
-      else if (matchesKey(data, "pageDown")) this.scroll += 10;
-      else if (matchesKey(data, "pageUp")) this.scroll = Math.max(0, this.scroll - 10);
-      else this.handleAction(data, this.adapter.getRunById(this.detailId));
+      } else if (data === "t" && detailRun && isActiveState(detailRun.state)) {
+        this.liveTranscript = !this.liveTranscript;
+        this.transcriptFollow = true;
+        this.scroll = 0;
+        if (!this.liveTranscript) {
+          this.exitLiveTranscript();
+        } else {
+          this.syncTranscriptPoll();
+        }
+      } else if (matchesKey(data, "down") || data === "j") {
+        this.scroll++;
+      } else if (matchesKey(data, "up") || data === "k") {
+        this.scroll = Math.max(0, this.scroll - 1);
+        if (this.liveTranscript) this.transcriptFollow = false;
+      } else if (matchesKey(data, "pageDown")) {
+        this.scroll += 10;
+      } else if (matchesKey(data, "pageUp")) {
+        this.scroll = Math.max(0, this.scroll - 10);
+        if (this.liveTranscript) this.transcriptFollow = false;
+      } else {
+        // Steering (and other actions) remain available from the live transcript pane.
+        this.handleAction(data, detailRun);
+      }
     } else if (matchesKey(data, "escape") || data === "q") {
       this.close();
       return;
@@ -188,15 +286,18 @@ export class SubagentsOverlay implements Component {
     } else if (matchesKey(data, "up") || data === "k") {
       this.selected = Math.max(0, this.selected - 1);
     } else if (matchesKey(data, "enter") && runs[this.selected]) {
+      this.exitLiveTranscript();
       this.detailId = runs[this.selected]!.id;
       this.scroll = 0;
     } else {
       this.handleAction(data, runs[this.selected] ?? null);
     }
     this.syncAnimation();
+    this.syncTranscriptPoll();
     this.invalidate();
     this.tui.requestRender();
   }
+
 
 
 
@@ -260,59 +361,91 @@ export class SubagentsOverlay implements Component {
     const glyph = stateGlyph(run.state, theme, this.frame);
     body.push(`${glyph} ${theme.fg("dim", run.id)}`);
     body.push(theme.fg("dim", `${run.mode} · ${formatState(run.state)} · ${runStats(run, now)} · ${run.delivered ? "delivered" : "ready"}`));
-    if (run.summary) {
+
+    if (this.liveTranscript && isActiveState(run.state)) {
       body.push("");
-      for (const line of wrapLines(run.summary, width - 2)) body.push(theme.fg("text", line));
+      const followTag = this.transcriptFollow ? "live · follow" : "live · paused";
+      body.push(theme.fg("accent", ` Transcript (${followTag})`));
+      body.push(theme.fg("dim", "─".repeat(Math.max(0, width - 1))));
+      if (this.transcriptStatus === "missing" || this.transcriptStatus === "unset") {
+        body.push(theme.fg("muted", " waiting for child session…"));
+      } else if (this.transcriptStatus === "empty" || !this.transcriptLines.length) {
+        body.push(theme.fg("muted", " (no messages yet)"));
+      } else {
+        for (const line of this.transcriptLines) {
+          for (const wrapped of wrapLines(line, width - 2)) {
+            body.push(` ${theme.fg("toolOutput", wrapped)}`);
+          }
+        }
+      }
+    } else {
+      if (run.summary) {
+        body.push("");
+        for (const line of wrapLines(run.summary, width - 2)) body.push(theme.fg("text", line));
+      }
+
+      run.results.forEach((result, index) => {
+        body.push("");
+        const rGlyph = stateGlyph(result.state, theme, this.frame);
+        const label = theme.bold(theme.fg("toolTitle", result.label || `task-${index + 1}`));
+        const caps = [
+          result.model,
+          result.profile ? `${result.profile}/${result.canWrite ? "RW" : "RO"}` : "",
+          result.thinking ? `thinking:${result.thinking}` : "",
+        ].filter(Boolean).join(" · ");
+        body.push(truncateToWidth(`${rGlyph} ${label} ${theme.fg("dim", caps)}`, width));
+        const usage = result.usage;
+        const stats = [
+          usage?.turns ? `↻${usage.turns}` : "",
+          `${formatTokens((usage?.input ?? 0) + (usage?.output ?? 0))} tok`,
+          usage?.cost ? `$${usage.cost.toFixed(4)}` : "",
+        ].filter(Boolean).join(" · ");
+        body.push(theme.fg("dim", `  ${stats}`));
+        const pointers = [
+          result.outputFile ? `→ ${formatPath(result.outputFile)}` : "",
+          result.sessionId ? `session ${result.sessionId.slice(0, 8)}` : "",
+          result.worktree ? `⎇ ${result.worktree.branch}` : "",
+        ].filter(Boolean);
+        if (pointers.length) body.push(truncateToWidth(theme.fg("dim", `  ${pointers.join(" · ")}`), width));
+        if (result.errorMessage) {
+          for (const line of wrapLines(result.errorMessage, width - 2)) body.push(`  ${theme.fg("error", line)}`);
+        }
+        const text = result.transcript || result.finalOutput;
+        if (text) {
+          for (const line of wrapLines(text, width - 2)) body.push(`  ${theme.fg("toolOutput", line)}`);
+        } else if (!result.errorMessage) {
+          body.push(theme.fg("dim", "  (no output)"));
+        }
+      });
     }
 
-    run.results.forEach((result, index) => {
-      body.push("");
-      const rGlyph = stateGlyph(result.state, theme, this.frame);
-      const label = theme.bold(theme.fg("toolTitle", result.label || `task-${index + 1}`));
-      const caps = [
-        result.model,
-        result.profile ? `${result.profile}/${result.canWrite ? "RW" : "RO"}` : "",
-        result.thinking ? `thinking:${result.thinking}` : "",
-      ].filter(Boolean).join(" · ");
-      body.push(truncateToWidth(`${rGlyph} ${label} ${theme.fg("dim", caps)}`, width));
-      const usage = result.usage;
-      const stats = [
-        usage?.turns ? `↻${usage.turns}` : "",
-        `${formatTokens((usage?.input ?? 0) + (usage?.output ?? 0))} tok`,
-        usage?.cost ? `$${usage.cost.toFixed(4)}` : "",
-      ].filter(Boolean).join(" · ");
-      body.push(theme.fg("dim", `  ${stats}`));
-      const pointers = [
-        result.outputFile ? `→ ${formatPath(result.outputFile)}` : "",
-        result.sessionId ? `session ${result.sessionId.slice(0, 8)}` : "",
-        result.worktree ? `⎇ ${result.worktree.branch}` : "",
-      ].filter(Boolean);
-      if (pointers.length) body.push(truncateToWidth(theme.fg("dim", `  ${pointers.join(" · ")}`), width));
-      if (result.errorMessage) {
-        for (const line of wrapLines(result.errorMessage, width - 2)) body.push(`  ${theme.fg("error", line)}`);
-      }
-      const text = result.transcript || result.finalOutput;
-      if (text) {
-        for (const line of wrapLines(text, width - 2)) body.push(`  ${theme.fg("toolOutput", line)}`);
-      } else if (!result.errorMessage) {
-        body.push(theme.fg("dim", "  (no output)"));
-      }
-    });
-
     const pageSize = 24;
-    this.scroll = Math.max(0, Math.min(this.scroll, Math.max(0, body.length - pageSize)));
+    const maxScroll = Math.max(0, body.length - pageSize);
+    if (this.liveTranscript && this.transcriptFollow) {
+      this.scroll = maxScroll;
+    } else {
+      this.scroll = Math.max(0, Math.min(this.scroll, maxScroll));
+      // Reaching the end re-enables auto-follow for live tails.
+      if (this.liveTranscript && this.scroll >= maxScroll) this.transcriptFollow = true;
+    }
     const visible = body.slice(this.scroll, this.scroll + pageSize);
     const lines = visible.map((line) => truncateToWidth(line, width));
     if (body.length > pageSize) {
       lines.push(theme.fg("dim", ` ${this.scroll + visible.length}/${body.length} lines`));
     }
     lines.push("");
-    lines.push(truncateToWidth(theme.fg("dim", " ↑↓ scroll · esc back · c cancel · s steer · r resume · o output · a apply · x discard · d dismiss"), width));
+    const liveHelp = isActiveState(run.state)
+      ? (this.liveTranscript
+        ? " ↑↓ scroll · t hide transcript · esc back · c cancel · s steer · o output"
+        : " ↑↓ scroll · t transcript · esc back · c cancel · s steer · r resume · o output · a apply · x discard · d dismiss")
+      : " ↑↓ scroll · esc back · c cancel · s steer · r resume · o output · a apply · x discard · d dismiss";
+    lines.push(truncateToWidth(theme.fg("dim", liveHelp), width));
     return lines;
   }
 
   render(width: number): string[] {
     this.syncAnimation();
+    this.syncTranscriptPoll();
     const lines = this.header(width);
     lines.push(...(this.detailId ? this.detailLines(width) : this.listLines(width)));
     return lines.map((line) => truncateToWidth(line, width));
@@ -331,6 +464,7 @@ export class SubagentsOverlay implements Component {
   dispose(): void {
     this.disposed = true;
     this.stopAnimation();
+    this.stopTranscriptPoll();
     this.unsubscribe?.();
     this.unsubscribe = undefined;
   }
@@ -342,17 +476,65 @@ export function createSubagentsOverlay(tui: TUI, theme: Theme, adapter: Subagent
 
 /** Small pure model retained for regression tests. */
 export class SubagentsUIModel {
-  state = { listMode: true, selectedIndex: 0, scrollOffset: 0, expanded: false, detailId: undefined as string | undefined };
+  state = {
+    listMode: true,
+    selectedIndex: 0,
+    scrollOffset: 0,
+    expanded: false,
+    detailId: undefined as string | undefined,
+    /** Live transcript pane on a running run's detail view. */
+    liveTranscript: false,
+    /** Auto-follow newest lines unless the user scrolls up. */
+    transcriptFollow: true,
+  };
   constructor(private readonly adapter: SubagentAdapter) {}
   get runs(): RunSnapshot[] { return [...this.adapter.getActiveRuns(), ...this.adapter.getCompletedRuns()]; }
   select(index: number): void { this.state.selectedIndex = Math.max(0, Math.min(index, Math.max(0, this.runs.length - 1))); }
   toggleExpanded(): void { this.state.expanded = !this.state.expanded; }
-  drillDown(): void { const run = this.runs[this.state.selectedIndex]; if (run) { this.state.listMode = false; this.state.detailId = run.id; } }
-  goBack(): void { this.state.listMode = true; this.state.detailId = undefined; }
+  drillDown(): void {
+    const run = this.runs[this.state.selectedIndex];
+    if (run) {
+      this.state.listMode = false;
+      this.state.detailId = run.id;
+      this.state.liveTranscript = false;
+      this.state.transcriptFollow = true;
+      this.state.scrollOffset = 0;
+    }
+  }
+  goBack(): void {
+    this.state.listMode = true;
+    this.state.detailId = undefined;
+    this.state.liveTranscript = false;
+    this.state.transcriptFollow = true;
+    this.state.scrollOffset = 0;
+  }
+  /** Toggle live transcript for the active detail run when it is still running. */
+  toggleLiveTranscript(): boolean {
+    if (this.state.listMode || !this.state.detailId) return false;
+    const run = this.adapter.getRunById(this.state.detailId);
+    if (!run || !isActiveState(run.state)) return false;
+    this.state.liveTranscript = !this.state.liveTranscript;
+    this.state.transcriptFollow = true;
+    this.state.scrollOffset = 0;
+    return true;
+  }
+  scrollUp(amount = 1): void {
+    this.state.scrollOffset = Math.max(0, this.state.scrollOffset - amount);
+    if (this.state.liveTranscript) this.state.transcriptFollow = false;
+  }
+  scrollDown(amount = 1): void {
+    this.state.scrollOffset += amount;
+    // Down toward the end does not pause follow; up does.
+  }
   simulateKey(key: string): UIAction | null {
     if (key === "Escape") return { type: "close" };
     if (key === "Enter") { this.drillDown(); return { type: "select", id: this.state.detailId }; }
+    if (key === "t") {
+      if (this.toggleLiveTranscript()) return { type: "transcript", id: this.state.detailId };
+      return null;
+    }
     if (key === "c") return { type: "cancel", id: this.runs[this.state.selectedIndex]?.id };
+    if (key === "s" && this.state.detailId) return { type: "steer", id: this.state.detailId };
     return null;
   }
   isRunning(): boolean { return this.runs.some((run) => isActiveState(run.state)); }

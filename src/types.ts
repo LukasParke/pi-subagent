@@ -54,6 +54,8 @@ export interface TaskSpec {
   forkResume?: boolean;
   isolation?: "shared" | "worktree";
   allowSharedWrites?: boolean;
+  /** Seed worktree with parent checkout WIP (worktree isolation only). */
+  includeWip?: boolean;
   /** Opt out of process-tree reaping after a clean exit (e.g. child-started dev servers). */
   keepBackground?: boolean;
   /** Wrap-up grace turns after a max_turns/max_cost breach before SIGTERM. 0 = immediate stop. */
@@ -66,6 +68,8 @@ export interface TaskSpec {
   contextFork?: boolean;
   /** Parent session file used for contextFork. */
   parentSessionFile?: string;
+  /** What this child may itself spawn; encoded into PI_SUBAGENT_SPAWNS. */
+  spawns?: false | "*" | string[];
   /** JSON-Schema subset the child's final fenced json:result block must satisfy. */
   outputSchema?: Record<string, unknown>;
 }

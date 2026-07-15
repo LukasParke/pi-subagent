@@ -80,14 +80,18 @@ Invariants:
 16. Worktrees live under a durable root (`~/.pi/subagent-worktrees`), never a purgeable OS
     tmpdir. Startup maintenance (top-level parents only) prunes stale git registrations,
     removes unchanged leftovers, and sweeps changed-but-expired worktrees. Live-run
-    worktrees are always shielded.
+    worktrees are always shielded. `include_wip` worktrees carry the parent's WIP patch in
+    the handle: `diff`/`apply` subtract it when subtraction is clean and otherwise report
+    the combined delta with an explicit `[includes parent WIP]` warning — never silently
+    wrong; a worktree containing only the untouched WIP patch counts as unchanged.
 17. Process-tree reaping after a clean exit can be disabled per task with `keep_background`
     (for legitimately backgrounded work such as dev servers); forced stops always reap.
 18. Protocol completion prefers Pi's `agent_settled` event. Legacy `agent_end` without
     `willRetry` is accepted for older Pi builds; `agent_end` with `willRetry: true` is
     treated as non-terminal.
-19. Depth parsing fails closed on malformed values so env scrubbing cannot silently reset
-    the counter to top-level.
+19. Depth and spawn-policy parsing fail closed on malformed values: env scrubbing cannot
+    silently reset the depth counter to top-level, and a malformed `PI_SUBAGENT_SPAWNS`
+    disables spawning rather than unrestricting it.
 20. Budget breaches (`max_turns`/`max_cost`) steer a wrap-up message and allow grace
     turns before SIGTERM; a child that concludes within grace ends `partial` with
     `wrappedUp: true`. `graceTurns: 0` restores immediate stops.
@@ -112,3 +116,10 @@ Invariants:
 26. Arg repair only decodes free-text fields with high-signal escape patterns
     (literal \n or \") and no real newlines; identifier fields, tool lists, and
     Windows-path-like strings are never modified.
+27. Global slots are depth-tiered: `tryAcquireGlobalSlot(runId, depth)` admits only while
+    `activeAtOrBelowDepth(depth) < maxGlobalActive - reservedFor(depth)`, holding slots
+    back for deeper tiers so a full-width spawn tree cannot deadlock on its own children.
+    Slot records without a `depth` field count as depth 0.
+28. `action: "plan"` is a truth oracle: it runs the exact validation and preflights of a
+    real spawn and returns the resolved plan without spawning — never a softer check, and
+    never a registry entry.

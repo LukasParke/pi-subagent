@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest";
-import { validateSubagentRequest, parseDepth, WRITE_TOOLS, READ_ONLY_TOOLS } from "../src/policy.js";
+import { describe, it, expect, afterEach } from "vitest";
+import { validateSubagentRequest, parseDepth, parseSpawnPolicy, SPAWNS_ENV_VAR, WRITE_TOOLS, READ_ONLY_TOOLS } from "../src/policy.js";
 import type { ParentContext } from "../src/policy.js";
 
 const parent: ParentContext = {
@@ -172,6 +172,75 @@ describe("policy", () => {
     }
   });
 
+  it("action:plan requires task or tasks and sets planOnly", () => {
+    const alone = validateSubagentRequest({ action: "plan" }, parent);
+    expect(alone.ok).toBe(false);
+    if (!alone.ok) expect(alone.error).toMatch(/plan.*task/i);
+
+    const both = validateSubagentRequest(
+      { action: "plan", task: "a", tasks: [{ task: "b" }] },
+      parent,
+    );
+    const single = validateSubagentRequest({ action: "plan", task: "scan foo", profile: "explore" }, parent);
+    expect(single.ok).toBe(true);
+    if (!single.ok) return;
+    expect(single.planOnly).toBe(true);
+    expect(single.mode).toBe("single");
+    expect(single.tasks).toHaveLength(1);
+    expect(single.tasks[0]!.profile).toBe("explore");
+    expect(single.tasks[0]!.effectiveTools.length).toBeGreaterThan(0);
+
+    const par = validateSubagentRequest(
+      {
+        action: "plan",
+        tasks: [
+          { task: "A", profile: "explore" },
+          { task: "B", profile: "explore" },
+        ],
+      },
+      parent,
+    );
+    expect(par.ok).toBe(true);
+    if (!par.ok) return;
+    expect(par.planOnly).toBe(true);
+    expect(par.mode).toBe("parallel");
+    expect(par.tasks).toHaveLength(2);
+  });
+
+  it("action:plan is a truth oracle for parallel writer violations", () => {
+    const params = {
+      tasks: [
+        { task: "Edit A", profile: "general" as const, tools: ["edit", "read"] },
+        { task: "Edit B", profile: "general" as const, tools: ["write", "read"] },
+      ],
+    };
+    const real = validateSubagentRequest(params, parent);
+    const planned = validateSubagentRequest({ action: "plan", ...params }, parent);
+    expect(real.ok).toBe(false);
+    expect(planned.ok).toBe(false);
+    if (!real.ok && !planned.ok) expect(planned.error).toBe(real.error);
+  });
+
+  it("rejects include_wip without worktree isolation", () => {
+    const res = validateSubagentRequest(
+      { task: "Use dirty baseline", include_wip: true },
+      parent,
+    );
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toMatch(/include_wip requires isolation:"worktree"/i);
+  });
+
+  it("accepts include_wip with worktree isolation and maps includeWip", () => {
+    const res = validateSubagentRequest(
+      { task: "Use dirty baseline", isolation: "worktree", include_wip: true },
+      parent,
+    );
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.tasks[0]!.includeWip).toBe(true);
+    expect(res.tasks[0]!.isolation).toBe("worktree");
+  });
+
   it("uses description as the task label, truncated", () => {
     const res = validateSubagentRequest({ task: "Do things", description: "Audit auth flow" }, parent);
     expect(res.ok).toBe(true);
@@ -304,5 +373,83 @@ describe("policy", () => {
     expect(par.ok).toBe(true);
     if (!par.ok) return;
     expect(par.synthesis).toBe("merge findings");
+  });
+
+  describe("spawn policy", () => {
+    const saved = process.env[SPAWNS_ENV_VAR];
+    afterEach(() => {
+      if (saved === undefined) delete process.env[SPAWNS_ENV_VAR];
+      else process.env[SPAWNS_ENV_VAR] = saved;
+    });
+
+    it("parses unrestricted, disabled, allowlist, and fails closed on garbage", () => {
+      expect(parseSpawnPolicy(undefined)).toEqual({ kind: "unrestricted" });
+      expect(parseSpawnPolicy("*")).toEqual({ kind: "unrestricted" });
+      expect(parseSpawnPolicy("")).toEqual({ kind: "disabled" });
+      expect(parseSpawnPolicy("false")).toEqual({ kind: "disabled" });
+      expect(parseSpawnPolicy("reviewer")).toEqual({ kind: "allowlist", agents: ["reviewer"] });
+      expect(parseSpawnPolicy("reviewer, scout")).toEqual({ kind: "allowlist", agents: ["reviewer", "scout"] });
+      expect(parseSpawnPolicy("[Reviewer, Scout]")).toEqual({ kind: "allowlist", agents: ["reviewer", "scout"] });
+      // Malformed: control chars or reputation-breaking tokens → disabled, never unrestricted.
+      expect(parseSpawnPolicy("\x00junk")).toEqual({ kind: "disabled" });
+      expect(parseSpawnPolicy("../escape")).toEqual({ kind: "disabled" });
+      expect(parseSpawnPolicy("!!!")).toEqual({ kind: "disabled" });
+    });
+
+    it("rejects all spawns when the env policy is disabled", () => {
+      process.env[SPAWNS_ENV_VAR] = "";
+      const res = validateSubagentRequest({ task: "x", agent: "reviewer" }, parent);
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.error).toMatch(/disabled/i);
+    });
+
+    it("allowlist permits only named agents and rejects agentless", () => {
+      process.env[SPAWNS_ENV_VAR] = "reviewer";
+      const catalog = new Map([
+        [
+          "reviewer",
+          {
+            name: "reviewer",
+            description: "r",
+            source: "/r.md",
+            scope: "project" as const,
+            profile: "review" as const,
+            spawns: false as const,
+          },
+        ],
+        [
+          "scout",
+          {
+            name: "scout",
+            description: "s",
+            source: "/s.md",
+            scope: "project" as const,
+            profile: "explore" as const,
+          },
+        ],
+      ]);
+
+      const ok = validateSubagentRequest({ task: "review", agent: "reviewer" }, parent, { agents: catalog });
+      expect(ok.ok).toBe(true);
+      if (ok.ok) expect(ok.tasks[0]!.spawns).toBe(false);
+
+      const scout = validateSubagentRequest({ task: "x", agent: "scout" }, parent, { agents: catalog });
+      expect(scout.ok).toBe(false);
+      if (!scout.ok) {
+        expect(scout.error).toMatch(/allowlist/i);
+        expect(scout.error).toMatch(/reviewer/);
+      }
+
+      const agentless = validateSubagentRequest({ task: "x" }, parent, { agents: catalog });
+      expect(agentless.ok).toBe(false);
+      if (!agentless.ok) expect(agentless.error).toMatch(/agentless|allowlist/i);
+    });
+
+    it("unrestricted paths behave as today when env is unset", () => {
+      delete process.env[SPAWNS_ENV_VAR];
+      const res = validateSubagentRequest({ task: "hello", profile: "explore" }, parent);
+      expect(res.ok).toBe(true);
+      if (res.ok) expect(res.tasks[0]!.spawns).toBeUndefined();
+    });
   });
 });

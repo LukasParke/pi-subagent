@@ -90,4 +90,44 @@ describe("config", () => {
     expect(sanitizeConfigOverrides({ taskDefaults: "nope" }).taskDefaults).toBeUndefined();
     expect(sanitizeConfigOverrides({ taskDefaults: {} }).taskDefaults).toBeUndefined();
   });
+
+  it("defaults widget and notifications, accepts overrides, drops invalid values", () => {
+    expect(defaultConfig.widget).toBe("background");
+    expect(defaultConfig.notifications).toBe("batched");
+
+    expect(sanitizeConfigOverrides({
+      widget: "off",
+      notifications: "off",
+    })).toEqual({ widget: "off", notifications: "off" });
+
+    // invalid modes fall back to omitted (defaults apply at loadConfig)
+    expect(sanitizeConfigOverrides({
+      widget: "always",
+      notifications: true,
+      maxRetries: 2,
+    })).toEqual({ maxRetries: 2 });
+
+    const env = {
+      PI_SUBAGENT_WIDGET: "off",
+      PI_SUBAGENT_NOTIFICATIONS: "off",
+    } as NodeJS.ProcessEnv;
+    expect(configFromEnv(env)).toEqual({ widget: "off", notifications: "off" });
+
+    // malformed env ignored so loadConfig keeps defaults
+    const badEnv = {
+      PI_SUBAGENT_WIDGET: "maybe",
+      PI_SUBAGENT_NOTIFICATIONS: "spam",
+    } as NodeJS.ProcessEnv;
+    expect(configFromEnv(badEnv)).toEqual({});
+    const loaded = loadConfig({}, badEnv);
+    expect(loaded.widget).toBe("background");
+    expect(loaded.notifications).toBe("batched");
+
+    const fileAndEnv = loadConfig(
+      { widget: "off", notifications: "off" },
+      { PI_SUBAGENT_WIDGET: "background" } as NodeJS.ProcessEnv,
+    );
+    expect(fileAndEnv.widget).toBe("background"); // env wins
+    expect(fileAndEnv.notifications).toBe("off"); // file, no env override
+  });
 });

@@ -89,6 +89,12 @@ preview, artifact pointers); the LLM sees plain text with run ids and a
   finished run's changed worktree into the main checkout (confirm dialog),
   `x` discard worktree + branch (confirm dialog), Enter drill-down,
   Esc/b back, Esc/q close.
+- Live transcript (`t` on a **running** run's detail): tails the child's
+  session file (`sessionDir/<…sessionId…>.jsonl`) on a 500ms poll while the
+  pane is visible — compact role/tool lines, auto-follow unless you scroll
+  up (which pauses follow). No RPC reads; hidden/finished runs never poll.
+  Missing file shows “waiting for child session…”. `s` steering still works
+  from the same pane so observe → steer stays on one surface.
 
 ### `/subagent-cost`
 Prints the root/subagents/combined ledger once, on demand.

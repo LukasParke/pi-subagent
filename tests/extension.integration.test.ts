@@ -76,12 +76,18 @@ describe("extension end-to-end wiring", () => {
   let originalDelay: string | undefined;
 
   let originalBin: string | undefined;
+  let originalWidget: string | undefined;
+  let originalNotifications: string | undefined;
+
 
   beforeEach(async () => {
     originalPath = process.env.PATH;
     originalMode = process.env.FAKE_PI_MODE;
     originalDelay = process.env.FAKE_PI_DELAY_MS;
     originalBin = process.env.PI_SUBAGENT_BIN;
+    originalWidget = process.env.PI_SUBAGENT_WIDGET;
+    originalNotifications = process.env.PI_SUBAGENT_NOTIFICATIONS;
+
     bin = await fs.mkdtemp(path.join(os.tmpdir(), "pi-subagent-bin-"));
     const fake = path.resolve("tests/helpers/fake-pi.mjs");
     const script = `#!/bin/sh\nexec "${process.execPath}" "${fake}" "$@"\n`;
@@ -92,6 +98,9 @@ describe("extension end-to-end wiring", () => {
     process.env.PATH = `${bin}:${originalPath}`;
     process.env.FAKE_PI_MODE = "success";
     delete process.env.FAKE_PI_DELAY_MS;
+    delete process.env.PI_SUBAGENT_WIDGET;
+    delete process.env.PI_SUBAGENT_NOTIFICATIONS;
+
     // Force re-resolution under the new env for any cached launch state.
     const { _resetLaunchCacheForTests } = await import("../src/launch.js");
     _resetLaunchCacheForTests();
@@ -102,6 +111,9 @@ describe("extension end-to-end wiring", () => {
     if (originalMode === undefined) delete process.env.FAKE_PI_MODE; else process.env.FAKE_PI_MODE = originalMode;
     if (originalDelay === undefined) delete process.env.FAKE_PI_DELAY_MS; else process.env.FAKE_PI_DELAY_MS = originalDelay;
     if (originalBin === undefined) delete process.env.PI_SUBAGENT_BIN; else process.env.PI_SUBAGENT_BIN = originalBin;
+    if (originalWidget === undefined) delete process.env.PI_SUBAGENT_WIDGET; else process.env.PI_SUBAGENT_WIDGET = originalWidget;
+    if (originalNotifications === undefined) delete process.env.PI_SUBAGENT_NOTIFICATIONS; else process.env.PI_SUBAGENT_NOTIFICATIONS = originalNotifications;
+
     const { _resetLaunchCacheForTests } = await import("../src/launch.js");
     _resetLaunchCacheForTests();
     await fs.rm(bin, { recursive: true, force: true });
@@ -367,6 +379,44 @@ describe("extension end-to-end wiring", () => {
     await h.handlers.get("session_shutdown")!();
   });
 
+  it("skips batched completion messages when notifications are off", async () => {
+    process.env.PI_SUBAGENT_NOTIFICATIONS = "off";
+    const h = harness();
+    await h.handlers.get("session_start")!({}, h.ctx);
+    const started = await execute(h, { task: "bg silent", profile: "explore", async: true });
+    const id = runId(started.content[0].text);
+    await vi.waitFor(() => {
+      const terminal = h.entries.find((entry) => entry.customType === RUN_ENTRY_TYPE && entry.data.id === id && entry.data.type === "terminal");
+      expect(terminal).toBeTruthy();
+    });
+    // Default batcher debounce is 2s; wait past that to ensure nothing would flush.
+    await new Promise((resolve) => setTimeout(resolve, 2_600));
+    expect(h.sentMessages).toHaveLength(0);
+    await h.handlers.get("session_shutdown")!();
+  });
+
+  it("renders no ambient widget when widget mode is off", async () => {
+    process.env.PI_SUBAGENT_WIDGET = "off";
+    const h = harness();
+    h.ctx.hasUI = true;
+    await h.handlers.get("session_start")!({}, h.ctx);
+    process.env.FAKE_PI_MODE = "pause-after-message";
+    const started = await execute(h, { task: "bg visually quiet", profile: "explore", async: true });
+    const id = runId(started.content[0].text);
+    // Let the run checkpoint so footer/widget refresh would normally fire.
+    await vi.waitFor(() => {
+      const run = h.entries.find((entry) => entry.customType === RUN_ENTRY_TYPE && entry.data.id === id && entry.data.type === "checkpoint");
+      expect(run).toBeTruthy();
+    });
+    // Allow a refresh tick; timer would paint with background mode on.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const painted = h.ctx.ui.setWidget.mock.calls.filter((call: unknown[]) => call[0] === "subagent" && call[1] != null);
+    expect(painted).toHaveLength(0);
+    await execute(h, { action: "wait", id });
+    await h.handlers.get("session_shutdown")!();
+  });
+
+
   it("delivers validated structured output as JSON end-to-end", async () => {
     const h = harness();
     await h.handlers.get("session_start")!({}, h.ctx);
@@ -406,6 +456,121 @@ describe("extension end-to-end wiring", () => {
     await execute(h, { action: "wait", id });
     await expect(execute(h, { action: "diff", id })).rejects.toThrow(/no changed worktrees/i);
     await expect(execute(h, { action: "apply", id })).rejects.toThrow(/no changed worktrees/i);
+    await h.handlers.get("session_shutdown")!();
+  });
+
+  it("enforces parent spawn allowlist and agent spawns frontmatter", async () => {
+    const project = await fs.mkdtemp(path.join(os.tmpdir(), "pi-subagent-spawns-"));
+    await fs.mkdir(path.join(project, ".pi", "agents"), { recursive: true });
+    await fs.writeFile(
+      path.join(project, ".pi", "agents", "reviewer.md"),
+      "---\ndescription: Review only\nprofile: review\nspawns: false\n---\nReview carefully.\n",
+    );
+    await fs.writeFile(
+      path.join(project, ".pi", "agents", "scout.md"),
+      "---\ndescription: Scout\nprofile: explore\nspawns: reviewer\n---\nBe terse.\n",
+    );
+
+    const originalSpawns = process.env.PI_SUBAGENT_SPAWNS;
+    delete process.env.PI_SUBAGENT_SPAWNS;
+
+    try {
+      const h = harness();
+      h.ctx.cwd = project;
+      await h.handlers.get("session_start")!({}, h.ctx);
+
+      // Restricted persona spawns successfully; its own spawns field rides to the child.
+      const scouted = await execute(h, { task: "map", agent: "scout" });
+      expect(scouted.isError).not.toBe(true);
+      expect(scouted.details.results[0].label).toBe("scout");
+
+      // Runtime parent policy: only reviewer allowed (agentless and scout rejected).
+      process.env.PI_SUBAGENT_SPAWNS = "reviewer";
+      await expect(execute(h, { task: "agentless" })).rejects.toThrow(/allowlist|agentless/i);
+      await expect(execute(h, { task: "x", agent: "scout" })).rejects.toThrow(/allowlist/i);
+      const allowed = await execute(h, { task: "review", agent: "reviewer" });
+      expect(allowed.isError).not.toBe(true);
+      expect(allowed.details.results[0].label).toBe("reviewer");
+
+      // Disabled policy rejects all new spawns and names the restriction.
+      process.env.PI_SUBAGENT_SPAWNS = "";
+      await expect(execute(h, { task: "x", agent: "reviewer" })).rejects.toThrow(/disabled/i);
+
+      await h.handlers.get("session_shutdown")!();
+    } finally {
+      if (originalSpawns === undefined) delete process.env.PI_SUBAGENT_SPAWNS;
+      else process.env.PI_SUBAGENT_SPAWNS = originalSpawns;
+      await fs.rm(project, { recursive: true, force: true });
+    }
+  });
+
+  it("does not register the subagent tool when spawn policy is disabled at boot", async () => {
+    const originalSpawns = process.env.PI_SUBAGENT_SPAWNS;
+    process.env.PI_SUBAGENT_SPAWNS = "";
+    try {
+      const h = harness();
+      expect(h.tool).toBeUndefined();
+    } finally {
+      if (originalSpawns === undefined) delete process.env.PI_SUBAGENT_SPAWNS;
+      else process.env.PI_SUBAGENT_SPAWNS = originalSpawns;
+    }
+  });
+
+  it("surfaces resumable session ids in bare and run-specific status", async () => {
+    const h = harness();
+    await h.handlers.get("session_start")!({}, h.ctx);
+    const result = await execute(h, { task: "sess", profile: "explore" });
+    expect(result.isError).not.toBe(true);
+    const terminal = h.entries.find((entry) => entry.customType === RUN_ENTRY_TYPE && entry.data.type === "terminal");
+    const id = terminal?.data?.id as string;
+    expect(id).toMatch(/^[0-9a-f-]{36}$/i);
+    // Fake-pi emits a fixed child session id.
+    const bare = await execute(h, { action: "status" });
+    expect(bare.content[0].text).toMatch(/session test-ses \(resumable\)/);
+    const specific = await execute(h, { action: "status", id });
+    expect(specific.content[0].text).toContain("session test-session-123");
+    expect(specific.content[0].text).not.toMatch(/\(resumable\)/);
+    await h.handlers.get("session_shutdown")!();
+  });
+
+  it("action:plan dry-runs validation without spawning a run", async () => {
+    const h = harness();
+    await h.handlers.get("session_start")!({}, h.ctx);
+
+    const planned = await execute(h, {
+      action: "plan",
+      tasks: [
+        { task: "Scan auth", description: "Auth scan", profile: "explore" },
+        { task: "Scan db", description: "DB scan", profile: "explore", model: "fake/model-b" },
+      ],
+    });
+    expect(planned.isError).not.toBe(true);
+    expect(planned.content[0].text).toMatch(/Plan \(dry-run, nothing spawned\)/);
+    expect(planned.content[0].text).toMatch(/Auth scan/);
+    expect(planned.content[0].text).toMatch(/tools=\[/);
+    expect(planned.details.plan).toHaveLength(2);
+    expect(planned.details.plan[0]).toMatchObject({
+      label: "Auth scan",
+      profile: "explore",
+      access: "RO",
+    });
+    expect(planned.details.plan[0].tools).toEqual(expect.arrayContaining(["read"]));
+    expect(planned.details.plan[1].model).toBe("fake/model-b");
+
+    const status = await execute(h, { action: "status" });
+    expect(status.content[0].text).toMatch(/No subagent runs/);
+
+    // Same shared-cwd writer error as a real spawn.
+    await expect(
+      execute(h, {
+        action: "plan",
+        tasks: [
+          { task: "Edit A", profile: "general", tools: ["edit", "read"] },
+          { task: "Edit B", profile: "general", tools: ["write", "read"] },
+        ],
+      }),
+    ).rejects.toThrow(/worktree|allow_shared_writes/i);
+
     await h.handlers.get("session_shutdown")!();
   });
 });

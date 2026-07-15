@@ -100,7 +100,9 @@ export async function runTasks(
       if (options.signal?.aborted) throw new Error("Subagent run cancelled before worktree setup");
       const spec = { ...specs[index]! };
       if (spec.isolation === "worktree") {
-        const handle = await worktrees.create(spec.cwd || process.cwd(), spec.task.slice(0, 20), options.signal);
+        const handle = await worktrees.create(spec.cwd || process.cwd(), spec.task.slice(0, 20), options.signal, {
+          includeWip: spec.includeWip === true,
+        });
         handles[index] = handle;
         spec.cwd = handle.cwd;
         // Announce the worktree immediately so live runs can shield it from GC sweeps.

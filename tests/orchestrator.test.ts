@@ -1,12 +1,26 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { spawn } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { isTransientFailure, runTasks } from "../src/orchestrator.js";
 import type { TaskResult } from "../src/types.js";
 import type { TaskSpec } from "../src/types.js";
+import { WorktreeManager } from "../src/worktree.js";
 // @ts-expect-error plain ESM child fixture
 import { getFakePiCommand } from "./helpers/fake-pi.mjs";
+
+async function run(cmd: string, args: string[], cwd: string) {
+  return new Promise<{ code: number; stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawn(cmd, args, { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (c) => (stdout += c.toString()));
+    child.stderr.on("data", (c) => (stderr += c.toString()));
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ code: code ?? 1, stdout, stderr }));
+  });
+}
 
 const spec = (extra: Partial<TaskSpec> = {}): TaskSpec => ({ task: "test", profile: "explore", tools: ["read"], timeoutMs: 2000, ...extra });
 
@@ -107,5 +121,57 @@ describe("orchestrator", () => {
     expect(result.results[0]!.state).toBe("failed");
     expect(result.results[0]!.attempts).toBe(2);
     expect(result.results[0]!.errorMessage).toContain("a/one → b/two");
+  });
+
+  it("threads includeWip into worktree create so the child sees parent dirty baseline", async () => {
+    const repo = await fs.mkdtemp(path.join(os.tmpdir(), "orch-wip-repo-"));
+    const wtRoot = await fs.mkdtemp(path.join(os.tmpdir(), "orch-wip-wt-"));
+    try {
+      await run("git", ["init"], repo);
+      await run("git", ["config", "user.email", "test@example.com"], repo);
+      await run("git", ["config", "user.name", "Test"], repo);
+      await fs.writeFile(path.join(repo, "README.md"), "base\n");
+      await run("git", ["add", "."], repo);
+      await run("git", ["commit", "-m", "init"], repo);
+      // Parent dirty: staged + unstaged + untracked.
+      await fs.writeFile(path.join(repo, "README.md"), "base\nstaged\n");
+      await run("git", ["add", "README.md"], repo);
+      await fs.writeFile(path.join(repo, "README.md"), "base\nstaged\nunstaged\n");
+      await fs.writeFile(path.join(repo, "parent-untracked.txt"), "from parent\n");
+
+      const manager = new WorktreeManager(undefined, wtRoot);
+      let seenCwd: string | undefined;
+      const result = await runTasks(
+        [spec({
+          task: "touch wip",
+          isolation: "worktree",
+          includeWip: true,
+          cwd: repo,
+          timeoutMs: 5000,
+        })],
+        {
+          getPiCommand: () => getFakePiCommand(),
+          sessionDir: path.join(dir, "sessions"),
+          worktrees: manager,
+          onTaskProgress: (_index, update) => {
+            if (update.worktree?.cwd) seenCwd = update.worktree.cwd;
+          },
+        },
+      );
+      expect(result.results[0]!.state).toBe("completed");
+      // With includeWip and no agent file edits (fake-pi doesn't touch disk), finalize
+      // treats pure WIP as unchanged → worktree cleaned, no preserved worktree on result.
+      expect(result.results[0]!.worktree).toBeUndefined();
+      // During the run the prepared cwd is the worktree; prove seed happened by
+      // inspecting onTaskProgress announcement path' sibling is gone, recreate with flag.
+      const reseed = await manager.create(repo, "verify", undefined, { includeWip: true });
+      expect(await fs.readFile(path.join(reseed.cwd, "README.md"), "utf8")).toContain("unstaged");
+      expect(await fs.readFile(path.join(reseed.cwd, "parent-untracked.txt"), "utf8")).toBe("from parent\n");
+      expect(seenCwd).toBeTruthy();
+      await manager.forceRemove(reseed);
+    } finally {
+      await fs.rm(repo, { recursive: true, force: true });
+      await fs.rm(wtRoot, { recursive: true, force: true });
+    }
   });
 });

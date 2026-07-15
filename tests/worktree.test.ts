@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { WorktreeManager } from "../src/worktree.js";
+import { INCLUDES_PARENT_WIP, WorktreeManager } from "../src/worktree.js";
 
 async function run(cmd: string, args: string[], cwd: string) {
   return new Promise<{ code: number; stdout: string; stderr: string }>((resolve, reject) => {
@@ -199,5 +199,83 @@ describe("WorktreeManager", () => {
     expect(expired.kept).toContain(live.cwd);
 
     await mgr.forceRemove(live);
+  });
+
+  async function makeDirtyParent(): Promise<void> {
+    // Staged + unstaged + untracked — the full dirty-baseline surface.
+    await fs.writeFile(path.join(repo, "README.md"), "hello\nstaged edit\n");
+    await run("git", ["add", "README.md"], repo);
+    await fs.writeFile(path.join(repo, "README.md"), "hello\nstaged edit\nunstaged too\n");
+    await fs.writeFile(path.join(repo, "untracked.txt"), "parent untracked\n");
+  }
+
+  it("includeWip seeds staged, unstaged, and untracked parent changes", async () => {
+    await makeDirtyParent();
+    const handle = await mgr.create(repo, "wip-seed", undefined, { includeWip: true });
+    expect(handle.wipPatch).toBeTruthy();
+    expect(handle.wipUntracked).toContain("untracked.txt");
+    expect(await fs.readFile(path.join(handle.cwd, "README.md"), "utf8")).toContain("unstaged too");
+    expect(await fs.readFile(path.join(handle.cwd, "untracked.txt"), "utf8")).toBe("parent untracked\n");
+    await mgr.forceRemove(handle);
+  });
+
+  it("diff on an untouched WIP-seeded worktree reports no agent changes", async () => {
+    await makeDirtyParent();
+    const handle = await mgr.create(repo, "wip-diff", undefined, { includeWip: true });
+    const diff = await mgr.diff(handle);
+    expect(diff.patch.trim()).toBe("");
+    expect(diff.stat).toBe("");
+    expect(diff.warning).toBeUndefined();
+    await mgr.forceRemove(handle);
+  });
+
+  it("apply lands only agent changes when WIP subtraction is clean", async () => {
+    await makeDirtyParent();
+    const handle = await mgr.create(repo, "wip-apply", undefined, { includeWip: true });
+    // Agent-only file (not part of parent WIP) keeps reverse-subtraction clean.
+    await fs.writeFile(path.join(handle.cwd, "agent-only.txt"), "agent work\n");
+
+    const result = await mgr.apply(handle, repo);
+    expect(result.applied).toBe(true);
+    expect(result.warning).toBeUndefined();
+    expect(await fs.readFile(path.join(repo, "agent-only.txt"), "utf8")).toBe("agent work\n");
+    // Parent WIP files are not re-applied / recreated: untracked was already on parent,
+    // and README content stays the parent's (no extra agent line).
+    expect(await fs.readFile(path.join(repo, "README.md"), "utf8")).toBe("hello\nstaged edit\nunstaged too\n");
+    expect(await fs.readFile(path.join(repo, "untracked.txt"), "utf8")).toBe("parent untracked\n");
+    await mgr.forceRemove(handle);
+  });
+
+  it("finalize treats untouched WIP-seeded worktree as unchanged", async () => {
+    await makeDirtyParent();
+    const handle = await mgr.create(repo, "wip-final", undefined, { includeWip: true });
+    const final = await mgr.finalize(handle);
+    expect(final.changed).toBe(false);
+    await expect(fs.stat(handle.cwd)).rejects.toThrow();
+  });
+
+  it("diff falls back to combined delta with parent-WIP warning when subtraction cannot clean", async () => {
+    await makeDirtyParent();
+    const handle = await mgr.create(repo, "wip-fallback", undefined, { includeWip: true });
+    // Corrupt stored baseline so reverse-apply is no longer exact.
+    const root = path.dirname(handle.cwd);
+    await fs.writeFile(path.join(root, "wip.patch"), "diff --git a/nope b/nope\nindex 111..222 100644\n--- a/nope\n+++ b/nope\n@@ -1 +1 @@\n-old\n+new\n", "utf8");
+    handle.wipPatch = undefined; // force reload of corrupted artifact
+    await fs.writeFile(path.join(handle.cwd, "agent-only.txt"), "agent work\n");
+    const diff = await mgr.diff({ cwd: handle.cwd, baseCommit: handle.baseCommit, baseCwd: handle.baseCwd });
+    expect(diff.warning).toBe(INCLUDES_PARENT_WIP);
+    expect(diff.patch).toContain("agent work");
+    // Combined path still contains parent WIP markers (e.g. unstaged too / untracked).
+    expect(diff.patch.includes("unstaged too") || diff.patch.includes("untracked") || diff.patch.includes("parent untracked")).toBe(true);
+    await mgr.forceRemove(handle);
+  });
+
+  it("default create does not seed parent WIP", async () => {
+    await makeDirtyParent();
+    const handle = await mgr.create(repo, "no-wip");
+    expect(handle.wipPatch).toBeUndefined();
+    expect(await fs.readFile(path.join(handle.cwd, "README.md"), "utf8")).toBe("hello\n");
+    await expect(fs.stat(path.join(handle.cwd, "untracked.txt"))).rejects.toThrow();
+    await mgr.forceRemove(handle);
   });
 });

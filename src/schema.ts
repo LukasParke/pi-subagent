@@ -20,6 +20,7 @@ const Action = Type.Union([
   Type.Literal("diff"),
   Type.Literal("apply"),
   Type.Literal("discard"),
+  Type.Literal("plan"),
 ]);
 
 /** Shared optional task configuration fields. */
@@ -56,6 +57,9 @@ export const TaskFields = {
   resume: Type.Optional(Type.String({ description: "Child session id to continue." })),
   fork_resume: Type.Optional(Type.Boolean({ description: "Fork the resumed session instead of direct resume." })),
   isolation: Type.Optional({ ...Isolation, description: "worktree runs the task in an isolated git worktree; changed work is preserved on a branch." }),
+  include_wip: Type.Optional(
+    Type.Boolean({ description: "Seed a worktree with the parent checkout's uncommitted changes (staged + unstaged + untracked). Only valid with isolation:'worktree'." }),
+  ),
   allow_shared_writes: Type.Optional(
     Type.Boolean({ description: "Unsafe opt-in for parallel writers sharing one checkout." }),
   ),
@@ -88,7 +92,7 @@ export const ParallelTaskItem = Type.Object(
 export const SubagentParamsSchema = Type.Object(
   {
     // Management actions
-    action: Type.Optional({ ...Action, description: "Management action on an existing run: status, wait, cancel, steer (inject guidance into a running child), diff/apply/discard (worktree results)." }),
+    action: Type.Optional({ ...Action, description: "Management action on an existing run: status, wait, cancel, steer (inject guidance into a running child), diff/apply/discard (worktree results). action:\"plan\" dry-runs validation + preflight with task/tasks — no spawn." }),
     id: Type.Optional(Type.String({ minLength: 1, description: "Run id (or unique prefix) for management actions." })),
     message: Type.Optional(Type.String({ minLength: 1, description: "Steering message injected into the running child (action: steer)." })),
     index: Type.Optional(Type.Number({ minimum: 0, description: "Task index within a parallel run for steer/diff/apply/discard. Defaults to the only eligible task." })),

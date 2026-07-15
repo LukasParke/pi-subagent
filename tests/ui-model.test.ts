@@ -109,4 +109,37 @@ describe('UI Models', () => {
     if (actionCancel) actions.push(actionCancel);
     expect(actions.some(a => a.type === 'cancel' || a.type === 'close')).toBe(true);
   });
+
+  it('toggles live transcript mode on running detail only', () => {
+    uiModel.drillDown();
+    expect(uiModel.state.listMode).toBe(false);
+    expect(uiModel.state.detailId).toBe('r1');
+    expect(uiModel.state.liveTranscript).toBe(false);
+
+    const toggled = uiModel.simulateKey('t');
+    expect(toggled?.type).toBe('transcript');
+    expect(uiModel.state.liveTranscript).toBe(true);
+    expect(uiModel.state.transcriptFollow).toBe(true);
+
+    // Scroll-up pauses auto-follow.
+    uiModel.scrollUp();
+    expect(uiModel.state.transcriptFollow).toBe(false);
+    expect(uiModel.state.scrollOffset).toBe(0);
+
+    // Toggle off.
+    expect(uiModel.simulateKey('t')?.type).toBe('transcript');
+    expect(uiModel.state.liveTranscript).toBe(false);
+
+    // Finished runs refuse the toggle.
+    adapter.getRunById = (id) => mockRun(id, 'completed' as RunState);
+    uiModel.state.detailId = 'c1';
+    uiModel.state.listMode = false;
+    expect(uiModel.simulateKey('t')).toBeNull();
+    expect(uiModel.state.liveTranscript).toBe(false);
+
+    // Steering still available from the detail view.
+    adapter.getRunById = (id) => mockRun(id, 'running' as RunState);
+    uiModel.state.detailId = 'r1';
+    expect(uiModel.simulateKey('s')?.type).toBe('steer');
+  });
 });

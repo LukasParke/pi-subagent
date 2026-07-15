@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import * as fs from "node:fs/promises";
+import { existsSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describeCatalog, discoverAgents, parseAgentFile, resolveAgent } from "../src/agents.js";
@@ -60,6 +61,61 @@ describe("agent file parsing", () => {
 
     const invalid = parseAgentFile("t", "---\noutput_schema: not-json\n---\nbody", "/t.md", "project")!;
     expect(invalid.outputSchema).toBeUndefined();
+  });
+
+  it("parses spawns as false, *, or agent lists", () => {
+    expect(parseAgentFile("a", "---\nspawns: false\n---\nx", "/a.md", "project")!.spawns).toBe(false);
+    expect(parseAgentFile("b", "---\nspawns: *\n---\nx", "/b.md", "project")!.spawns).toBe("*");
+    expect(parseAgentFile("c", "---\nspawns: reviewer\n---\nx", "/c.md", "project")!.spawns).toEqual(["reviewer"]);
+    expect(parseAgentFile("d", '---\nspawns: [reviewer, Scout]\n---\nx', "/d.md", "project")!.spawns).toEqual(["reviewer", "scout"]);
+    // Absent / empty → unrestricted denial absent on definition
+    expect(parseAgentFile("e", "---\ndescription: x\n---\nbody", "/e.md", "project")!.spawns).toBeUndefined();
+  });
+
+  it("expands @include lines one level with degrade-open failures", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-subagent-include-"));
+    try {
+      await fs.writeFile(path.join(dir, "extra.md"), "INCLUDED BODY\n@include deeper.md\n");
+      await fs.writeFile(path.join(dir, "deeper.md"), "DEEP SHOULD NOT EXPAND");
+      await fs.writeFile(path.join(dir, "big.md"), "x".repeat(65 * 1024));
+      await fs.writeFile(path.join(dir, "real-target.md"), "LINK TARGET");
+      const link = path.join(dir, "linked.md");
+      try {
+        await fs.symlink(path.join(dir, "real-target.md"), link);
+      } catch {
+        // Some CI sandboxes disallow symlinks — skip only the symlink assert.
+      }
+
+      const agentPath = path.join(dir, "persona.md");
+      const raw = [
+        "---",
+        "description: with includes",
+        "---",
+        "Intro",
+        "@include extra.md",
+        "@include missing.md",
+        "@include big.md",
+        existsSync(link) ? "@include linked.md" : "@include missing-link.md",
+        "Outro",
+        "",
+      ].join("\n");
+      const agent = parseAgentFile("persona", raw, agentPath, "project")!;
+      expect(agent.systemPrompt).toContain("Intro");
+      expect(agent.systemPrompt).toContain("INCLUDED BODY");
+      // Includes do not recurse: the nested directive stays verbatim inside the expanded body.
+      expect(agent.systemPrompt).toContain("@include deeper.md");
+      expect(agent.systemPrompt).not.toContain("DEEP SHOULD NOT EXPAND");
+      // Missing / oversized / symlink leave the directive line as-is.
+      expect(agent.systemPrompt).toContain("@include missing.md");
+      expect(agent.systemPrompt).toContain("@include big.md");
+      if (existsSync(link)) {
+        expect(agent.systemPrompt).toContain("@include linked.md");
+        expect(agent.systemPrompt).not.toContain("LINK TARGET");
+      }
+      expect(agent.systemPrompt).toContain("Outro");
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
   });
 });
 
