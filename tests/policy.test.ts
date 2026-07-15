@@ -12,11 +12,13 @@ const parent: ParentContext = {
 };
 
 describe("policy", () => {
-  it("parses depth robustly", () => {
+  it("parses depth robustly and fails closed on malformed values", () => {
     expect(parseDepth(undefined)).toBe(0);
+    expect(parseDepth("")).toBe(0);
     expect(parseDepth("2")).toBe(2);
-    expect(parseDepth("nope")).toBe(0);
-    expect(parseDepth("-3")).toBe(0);
+    // Malformed / negative: fail closed so env scrubbing cannot reset to top-level.
+    expect(parseDepth("nope")).toBe(100);
+    expect(parseDepth("-3")).toBe(100);
   });
 
   it("rejects depth overflow", () => {
@@ -147,5 +149,142 @@ describe("policy", () => {
     expect(res.mode).toBe("status");
     expect(res.id).toBe("abc");
     expect(res.tasks).toEqual([]);
+  });
+
+  it("steer requires id and a non-empty message", () => {
+    expect(validateSubagentRequest({ action: "steer" }, parent).ok).toBe(false);
+    expect(validateSubagentRequest({ action: "steer", id: "abc" }, parent).ok).toBe(false);
+    expect(validateSubagentRequest({ action: "steer", id: "abc", message: "  " }, parent).ok).toBe(false);
+    const ok = validateSubagentRequest({ action: "steer", id: "abc", message: "focus on tests", index: 1 }, parent);
+    expect(ok.ok).toBe(true);
+    if (!ok.ok) return;
+    expect(ok.mode).toBe("steer");
+    expect(ok.message).toBe("focus on tests");
+    expect(ok.index).toBe(1);
+  });
+
+  it("worktree actions require a run id", () => {
+    for (const action of ["diff", "apply", "discard"] as const) {
+      expect(validateSubagentRequest({ action }, parent).ok).toBe(false);
+      const ok = validateSubagentRequest({ action, id: "abc" }, parent);
+      expect(ok.ok).toBe(true);
+      if (ok.ok) expect(ok.mode).toBe(action);
+    }
+  });
+
+  it("uses description as the task label, truncated", () => {
+    const res = validateSubagentRequest({ task: "Do things", description: "Audit auth flow" }, parent);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.tasks[0]!.label).toBe("Audit auth flow");
+
+    const long = validateSubagentRequest({ task: "x", description: "y".repeat(200) }, parent);
+    expect(long.ok).toBe(true);
+    if (!long.ok) return;
+    expect(long.tasks[0]!.label.length).toBeLessThanOrEqual(60);
+  });
+
+  it("applies per-profile task defaults with explicit values winning", () => {
+    const taskDefaults = {
+      explore: { model: "openrouter/kimi-k2.6", thinking: "medium" as const, maxTurns: 12, maxCost: 0.2, timeoutMs: 60_000 },
+      general: { model: "openrouter/grok-4.5" },
+    };
+    // Parallel tasks default to explore → explore defaults kick in.
+    const par = validateSubagentRequest({ tasks: [{ task: "scan" }] }, parent, { taskDefaults });
+    expect(par.ok).toBe(true);
+    if (!par.ok) return;
+    expect(par.tasks[0]!.model).toBe("openrouter/kimi-k2.6");
+    expect(par.tasks[0]!.thinking).toBe("medium");
+    expect(par.tasks[0]!.maxTurns).toBe(12);
+    expect(par.tasks[0]!.maxCost).toBe(0.2);
+    expect(par.tasks[0]!.timeoutMs).toBe(60_000);
+
+    // Explicit request values beat profile defaults.
+    const explicit = validateSubagentRequest(
+      { tasks: [{ task: "scan", model: "custom/model", thinking: "high", max_turns: 3 }] },
+      parent,
+      { taskDefaults },
+    );
+    expect(explicit.ok).toBe(true);
+    if (!explicit.ok) return;
+    expect(explicit.tasks[0]!.model).toBe("custom/model");
+    expect(explicit.tasks[0]!.thinking).toBe("high");
+    expect(explicit.tasks[0]!.maxTurns).toBe(3);
+
+    // Single-task mode defaults to general → general defaults kick in.
+    const single = validateSubagentRequest({ task: "implement" }, parent, { taskDefaults });
+    expect(single.ok).toBe(true);
+    if (!single.ok) return;
+    expect(single.tasks[0]!.model).toBe("openrouter/grok-4.5");
+
+    // Profile defaults beat parent inheritance but parent still fills the rest.
+    expect(single.tasks[0]!.thinking).toBe(parent.thinking);
+  });
+
+  it("context:'fork' requires a persisted parent session and is single-task only", () => {
+    // No session file → rejected with guidance.
+    const noFile = validateSubagentRequest({ task: "x", context: "fork" }, parent);
+    expect(noFile.ok).toBe(false);
+    if (!noFile.ok) expect(noFile.error).toMatch(/persisted parent session/i);
+
+    const withFile = { ...parent, sessionFile: "/tmp/parent-session.jsonl" };
+    const ok = validateSubagentRequest({ task: "x", context: "fork" }, withFile);
+    expect(ok.ok).toBe(true);
+    if (!ok.ok) return;
+    expect(ok.tasks[0]!.contextFork).toBe(true);
+    expect(ok.tasks[0]!.parentSessionFile).toBe("/tmp/parent-session.jsonl");
+
+    // fresh (default) never forks.
+    const fresh = validateSubagentRequest({ task: "x" }, withFile);
+    expect(fresh.ok).toBe(true);
+    if (fresh.ok) expect(fresh.tasks[0]!.contextFork).toBe(false);
+
+    // fork + resume conflict.
+    const conflict = validateSubagentRequest({ task: "x", context: "fork", resume: "child-1" }, withFile);
+    expect(conflict.ok).toBe(false);
+
+    // Parallel fanout with fork rejected.
+    const par = validateSubagentRequest(
+      { tasks: [{ task: "a", context: "fork" }, { task: "b" }] },
+      withFile,
+    );
+    expect(par.ok).toBe(false);
+    if (!par.ok) expect(par.error).toMatch(/single-task only/i);
+  });
+
+  it("passes grace_turns, fallback_models, and max_retries through with profile defaults", () => {
+    const taskDefaults = { general: { fallbackModels: ["fallback/model"], maxRetries: 2 } };
+    const explicit = validateSubagentRequest(
+      { task: "x", grace_turns: 5, fallback_models: ["a/b"], max_retries: 0 },
+      parent,
+      { taskDefaults },
+    );
+    expect(explicit.ok).toBe(true);
+    if (!explicit.ok) return;
+    expect(explicit.tasks[0]!.graceTurns).toBe(5);
+    expect(explicit.tasks[0]!.fallbackModels).toEqual(["a/b"]);
+    expect(explicit.tasks[0]!.maxRetries).toBe(0);
+
+    const defaulted = validateSubagentRequest({ task: "x" }, parent, { taskDefaults });
+    expect(defaulted.ok).toBe(true);
+    if (!defaulted.ok) return;
+    expect(defaulted.tasks[0]!.fallbackModels).toEqual(["fallback/model"]);
+    expect(defaulted.tasks[0]!.maxRetries).toBe(2);
+
+    const invalid = validateSubagentRequest({ task: "x", grace_turns: -1 }, parent);
+    expect(invalid.ok).toBe(false);
+  });
+
+  it("synthesis is parallel-only and passes through trimmed", () => {
+    const single = validateSubagentRequest({ task: "x", synthesis: "fold it" }, parent);
+    expect(single.ok).toBe(false);
+
+    const par = validateSubagentRequest(
+      { tasks: [{ task: "a" }, { task: "b" }], synthesis: "  merge findings  " },
+      parent,
+    );
+    expect(par.ok).toBe(true);
+    if (!par.ok) return;
+    expect(par.synthesis).toBe("merge findings");
   });
 });

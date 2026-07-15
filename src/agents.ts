@@ -1,0 +1,207 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import type { TaskProfile } from "./types.js";
+import type { ThinkingLevel } from "./config.js";
+
+/**
+ * Named agent files: reusable subagent personas discovered from the same
+ * conventional locations the ecosystem uses for skills.
+ *
+ * Discovery roots (highest precedence first — same name in a higher root wins):
+ *   1. <cwd>/.pi/agents/<name>.md            project (authoritative)
+ *   2. <cwd>/.agents/agents/<name>.md        shared cross-tool workspace
+ *   3. $PI_CODING_AGENT_DIR/agents/<name>.md global (default ~/.pi/agent/agents/)
+ *
+ * Format: YAML frontmatter + markdown body. The body becomes the child's
+ * appended system prompt. Frontmatter fields use the same snake_case names as
+ * the tool parameters they default.
+ *
+ * Precedence at run time: explicit request params > agent file > per-profile
+ * config taskDefaults > parent inheritance. Agent files supply defaults for a
+ * persona; the orchestrator can still override any field per call.
+ */
+
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+const PROFILES = ["explore", "review", "general"] as const;
+
+export interface AgentDefinition {
+  /** Agent name (the file name without extension). */
+  name: string;
+  /** One-line routing description shown to the orchestrating model. */
+  description: string;
+  /** Markdown body — appended to the child's system prompt. */
+  systemPrompt?: string;
+  /** File the definition was loaded from. */
+  source: string;
+  /** Which discovery root supplied it. */
+  scope: "project" | "shared" | "global";
+  model?: string;
+  thinking?: ThinkingLevel;
+  profile?: TaskProfile;
+  tools?: string[];
+  maxTurns?: number;
+  maxCost?: number;
+  timeoutMs?: number;
+  graceTurns?: number;
+  fallbackModels?: string[];
+  maxRetries?: number;
+  isolation?: "shared" | "worktree";
+}
+
+/** Agent names are file-name-safe identifiers; anything else is skipped. */
+const NAME_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/i;
+
+function agentDir(): string {
+  const envDir = process.env.PI_CODING_AGENT_DIR?.trim();
+  if (envDir) {
+    return envDir.startsWith("~") ? path.join(os.homedir(), envDir.slice(1)) : envDir;
+  }
+  return path.join(os.homedir(), ".pi", "agent");
+}
+
+export function discoveryRoots(cwd: string): Array<{ dir: string; scope: AgentDefinition["scope"] }> {
+  return [
+    { dir: path.join(cwd, ".pi", "agents"), scope: "project" },
+    { dir: path.join(cwd, ".agents", "agents"), scope: "shared" },
+    { dir: path.join(agentDir(), "agents"), scope: "global" },
+  ];
+}
+
+// ── Frontmatter parsing (flat YAML subset; no dependency) ───────────────────
+
+function stripQuotes(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length >= 2 && ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'")))) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+/** `[a, b]` or `a, b` → string array. */
+function parseList(value: string): string[] {
+  const inner = value.trim().startsWith("[") && value.trim().endsWith("]")
+    ? value.trim().slice(1, -1)
+    : value;
+  return inner.split(",").map((item) => stripQuotes(item)).filter(Boolean);
+}
+
+function parseNumber(value: string): number | undefined {
+  const parsed = Number(value.trim());
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+export function parseAgentFile(name: string, raw: string, source: string, scope: AgentDefinition["scope"]): AgentDefinition | undefined {
+  let frontmatter: Record<string, string> = {};
+  let body = raw;
+  const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(raw);
+  if (match) {
+    body = raw.slice(match[0].length);
+    for (const line of match[1]!.split(/\r?\n/)) {
+      const separator = line.indexOf(":");
+      if (separator <= 0 || /^\s*#/.test(line)) continue;
+      const key = line.slice(0, separator).trim();
+      const value = line.slice(separator + 1).trim();
+      if (key && value) frontmatter[key] = value;
+    }
+  }
+
+  const thinking = frontmatter.thinking && (THINKING_LEVELS as readonly string[]).includes(frontmatter.thinking)
+    ? (frontmatter.thinking as ThinkingLevel)
+    : undefined;
+  const profile = frontmatter.profile && (PROFILES as readonly string[]).includes(frontmatter.profile)
+    ? (frontmatter.profile as TaskProfile)
+    : undefined;
+  const isolation = frontmatter.isolation === "worktree" ? "worktree" as const
+    : frontmatter.isolation === "shared" ? "shared" as const
+    : undefined;
+
+  const systemPrompt = body.trim() || undefined;
+  const definition: AgentDefinition = {
+    name,
+    description: stripQuotes(frontmatter.description ?? "").slice(0, 200) || name,
+    systemPrompt,
+    source,
+    scope,
+    model: frontmatter.model ? stripQuotes(frontmatter.model) : undefined,
+    thinking,
+    profile,
+    tools: frontmatter.tools ? parseList(frontmatter.tools) : undefined,
+    maxTurns: frontmatter.max_turns ? parseNumber(frontmatter.max_turns) : undefined,
+    maxCost: frontmatter.max_cost ? parseNumber(frontmatter.max_cost) : undefined,
+    timeoutMs: frontmatter.timeout_ms ? parseNumber(frontmatter.timeout_ms) : undefined,
+    graceTurns: frontmatter.grace_turns ? parseNumber(frontmatter.grace_turns) : undefined,
+    fallbackModels: frontmatter.fallback_models ? parseList(frontmatter.fallback_models) : undefined,
+    maxRetries: frontmatter.max_retries ? parseNumber(frontmatter.max_retries) : undefined,
+    isolation,
+  };
+  return definition;
+}
+
+// ── Discovery ────────────────────────────────────────────────────────────────
+
+const MAX_AGENT_FILE_BYTES = 64 * 1024;
+
+/**
+ * Discover agent definitions across the conventional roots. Synchronous by
+ * design: it runs at session start and on tool execute, reads a handful of
+ * small files, and failure of any root is silent (missing dirs are normal).
+ * Symlinked agent files are skipped (matching skill-loading conservatism).
+ */
+export function discoverAgents(cwd: string): Map<string, AgentDefinition> {
+  const catalog = new Map<string, AgentDefinition>();
+  // Iterate lowest precedence first so higher roots overwrite.
+  for (const root of [...discoveryRoots(cwd)].reverse()) {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(root.dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isFile() || entry.isSymbolicLink() || !entry.name.endsWith(".md")) continue;
+      const name = entry.name.slice(0, -3);
+      if (!NAME_PATTERN.test(name)) continue;
+      const file = path.join(root.dir, entry.name);
+      try {
+        const stat = fs.lstatSync(file);
+        if (!stat.isFile() || stat.size > MAX_AGENT_FILE_BYTES) continue;
+        const raw = fs.readFileSync(file, "utf8");
+        const definition = parseAgentFile(name.toLowerCase(), raw, file, root.scope);
+        if (definition) catalog.set(definition.name, definition);
+      } catch {
+        /* unreadable file: skip */
+      }
+    }
+  }
+  return catalog;
+}
+
+/** Case-insensitive lookup with a helpful error listing available names. */
+export function resolveAgent(
+  catalog: Map<string, AgentDefinition>,
+  name: string,
+): { agent?: AgentDefinition; error?: string } {
+  const agent = catalog.get(name.toLowerCase());
+  if (agent) return { agent };
+  const available = [...catalog.keys()].sort();
+  return {
+    error: available.length
+      ? `Unknown agent "${name}". Available agents: ${available.join(", ")}`
+      : `Unknown agent "${name}". No agent files found (define them in .pi/agents/<name>.md).`,
+  };
+}
+
+/** One line per agent for the tool guidelines / status output. */
+export function describeCatalog(catalog: Map<string, AgentDefinition>): string[] {
+  return [...catalog.values()]
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((agent) => {
+      const traits = [
+        agent.profile,
+        agent.model,
+        agent.isolation === "worktree" ? "worktree" : "",
+      ].filter(Boolean).join(", ");
+      return `${agent.name}: ${agent.description}${traits ? ` (${traits})` : ""}`;
+    });
+}

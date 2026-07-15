@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { visibleWidth } from '@earendil-works/pi-tui';
 import * as format from '../src/format.js';
 import type { UsageStats, RunSnapshot, RunState } from '../src/types.js';
 
@@ -40,28 +41,87 @@ describe('format helpers', () => {
     expect(format.formatPath('/very/long/path/that/should/be/truncated/for/display')).toMatch(/^\.\.\./);
   });
 
-  it('renders tool call and result with width safety', () => {
-    const theme = { fg: (c: string, t: string) => t, bold: (t: string) => t } as any;
-    const callLines = format.renderCall({ task: 'Implement UI for subagent with parallel support' }, {
-      theme,
-      width: 60,
-    });
-    expect(callLines.length).toBeGreaterThan(0);
-    expect(callLines[0]).toContain('subagent');
+  const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t } as any;
 
-    const result: RunSnapshot = {
-      schemaVersion: 1,
-      id: 'test-123',
-      sessionKey: 'sess',
+  it('renders a one-line call header with width safety', () => {
+    const line = format.renderCallLine({ task: 'Implement UI for subagent with parallel support and lots of extra words' }, theme, 60);
+    expect(line).toContain('subagent');
+    expect(visibleWidth(line)).toBeLessThanOrEqual(60);
+
+    const parallel = format.renderCallLine({ tasks: [{ task: 'a' }, { task: 'b' }] }, theme, 80);
+    expect(parallel).toContain('2 parallel tasks');
+
+    const action = format.renderCallLine({ action: 'status', id: 'abcdef1234567890' }, theme, 80);
+    expect(action).toContain('status');
+    expect(action).toContain('abcdef12');
+  });
+
+  it('renders a compact terminal run block', () => {
+    const run: format.InlineRunView = {
       mode: 'single',
       state: 'completed' as RunState,
       startedAt: Date.now() - 45000,
-      taskPreviews: ['preview'],
-      delivered: true,
-      results: [],
+      endedAt: Date.now(),
+      results: [{
+        label: 'task-1',
+        state: 'completed' as RunState,
+        usage: { turns: 8, input: 20000, output: 13800, cost: 0.012 },
+        finalOutput: 'Found 5 middleware call sites\nMore detail here',
+        outputFile: '/tmp/out.md',
+      }],
     };
-    const resultLines = format.renderResult(result, { theme, width: 50 });
-    expect(resultLines.some((l: string) => l.includes('done') || l.includes('completed') || l.includes('✓'))).toBe(true);
+    const lines = format.renderRunLines(run, { theme, width: 80 });
+    expect(lines[0]).toContain('↻8');
+    expect(lines[0]).toContain('tok');
+    expect(lines[0]).toContain('45s');
+    expect(lines.some((l) => l.includes('Found 5 middleware call sites'))).toBe(true);
+    expect(lines.some((l) => l.includes('/tmp/out.md'))).toBe(true);
+    expect(lines.every((l) => visibleWidth(l) <= 80)).toBe(true);
+  });
+
+  it('renders a fixed-shape streaming block with live activity', () => {
+    const run: format.InlineRunView = {
+      mode: 'single',
+      state: 'running' as RunState,
+      startedAt: Date.now() - 8000,
+      results: [{ label: 'task-1', state: 'running' as RunState, usage: { turns: 3, input: 10000, output: 2400, cost: 0 }, finalOutput: 'reading src/auth/middleware.ts…' }],
+    };
+    const lines = format.renderRunLines(run, { theme, width: 80, isPartial: true, spinnerFrame: 2 });
+    expect(lines.length).toBe(2);
+    expect(lines[0]).toContain(format.SPINNERS[2]);
+    expect(lines[1]).toContain('⎿');
+    expect(lines[1]).toContain('reading src/auth/middleware.ts');
+  });
+
+  it('renders parallel runs one line per task', () => {
+    const run: format.InlineRunView = {
+      mode: 'parallel',
+      state: 'running' as RunState,
+      startedAt: Date.now() - 9000,
+      results: [
+        { label: 't1', state: 'completed' as RunState, usage: { turns: 5, input: 15000, output: 6000, cost: 0.01 }, finalOutput: 'done thing' },
+        { label: 't2', state: 'running' as RunState, usage: { turns: 3, input: 9000, output: 3000, cost: 0 }, finalOutput: 'running tests…' },
+        { label: 't3', state: 'failed' as RunState, usage: { turns: 1, input: 100, output: 10, cost: 0 }, errorMessage: 'boom' },
+      ],
+    };
+    const lines = format.renderRunLines(run, { theme, width: 100, isPartial: true });
+    // completed + failed are both terminal → 2/3 done
+    expect(lines[0]).toContain('2/3 done');
+    expect(lines.some((l) => l.includes('t1'))).toBe(true);
+    expect(lines.some((l) => l.includes('t2') && l.includes('running tests'))).toBe(true);
+    expect(lines.some((l) => l.includes('t3') && l.includes('boom'))).toBe(true);
+  });
+
+  it('freezes duration at endedAt for finished runs', () => {
+    const run: format.InlineRunView = {
+      mode: 'single',
+      state: 'completed' as RunState,
+      startedAt: 1000,
+      endedAt: 13_000,
+      results: [{ label: 't', state: 'completed' as RunState, usage: { turns: 1, input: 10, output: 10, cost: 0 } }],
+    };
+    const lines = format.renderRunLines(run, { theme, width: 80, now: 10_000_000 });
+    expect(lines[0]).toContain('12s');
   });
 
   it('status preview is metadata only', () => {

@@ -67,6 +67,16 @@ describe("PersistenceLayer", () => {
     expect(new PersistenceLayer(adapterFor(entries), defaultConfig).rebuild("s").size).toBe(0);
   });
 
+  it("collects referenced child session ids for the retention keep-set", () => {
+    const adapter = adapterFor();
+    const p = new PersistenceLayer(adapter, { ...defaultConfig, sessionRetentionDays: 7 });
+    p.persist("r1", "s", "checkpoint", { state: "running", childSessionId: "child-a" });
+    p.persist("r2", "s", "terminal", { state: "completed", results: [result()] }); // result() has sessionId child-1
+    const plan = p.planRetention(new Set(["external"]));
+    expect(plan.keep).toEqual(expect.arrayContaining(["external", "child-a", "child-1"]));
+    expect(plan.candidates).toEqual([]);
+  });
+
   it("uses monotonic event sequence even within one millisecond", () => {
     vi.spyOn(Date, "now").mockReturnValue(100);
     const adapter = adapterFor();

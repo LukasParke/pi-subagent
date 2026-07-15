@@ -1,6 +1,6 @@
 {
   "name": "@lukehagar/pi-subagent",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "Production-grade isolated subagents for the Pi coding agent",
   "type": "module",
   "license": "MIT",
@@ -28,6 +28,7 @@
     "src",
     "docs",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "publishConfig": {

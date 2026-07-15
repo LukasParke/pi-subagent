@@ -6,7 +6,7 @@
 - **subagents** — provider-reported cumulative usage from child-run checkpoints and terminal events on that same branch.
 - **combined** — root + subagents.
 
-These totals appear in `subagent { action: "status" }`, per-run status, the footer status, and `/subagents`.
+These totals appear in `subagent { action: "status" }`, per-run status, the `/subagent-cost` command, and the `/subagents` overlay header. The footer stays terse (running/ready counts only) because Pi's native footer already shows session cost.
 
 ## Source of truth
 
@@ -26,6 +26,10 @@ It also retains provider-reported input/output/cache category costs, token count
 4. If an old run is evicted from in-memory UI history, its latest persisted usage still contributes to the session ledger.
 5. Active and immediately completed runs supplement or replace stale persisted checkpoints until newer session entries become visible; the full run UUID prevents double counting afterward.
 6. Resumed and forked invocations are distinct billed runs. Their new provider usage is counted once, even though they reuse prior context.
+7. Retry attempts (transient-failure retries and model fallbacks) accumulate into their
+   run's single usage record — every attempt's billed usage counts once, under one run
+   UUID, with `attemptedModels` recording the escalation path.
+8. The optional parallel `synthesis` child bills into the same run as an extra result.
 
 ## Branch semantics
 

@@ -1,9 +1,12 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { defaultConfig } from "./config.js";
+import { createGetPiCommand } from "./launch.js";
+import type { ProcessLockManager } from "./process-lock.js";
 import { ChildRunner, type GetPiCommand } from "./runner.js";
 import { Semaphore } from "./semaphore.js";
 import type { RunMode, RunState, TaskResult, TaskSpec } from "./types.js";
+import { addUsage } from "./usage.js";
 import { WorktreeManager, type WorktreeHandle } from "./worktree.js";
 
 export interface OrchestratorDeps {
@@ -11,7 +14,39 @@ export interface OrchestratorDeps {
   getPiCommand?: GetPiCommand;
   sessionDir?: string;
   worktrees?: WorktreeManager;
+  killGraceMs?: number;
+  locks?: ProcessLockManager;
+  runId?: string;
+  parentSessionKey?: string;
   onTaskProgress?: (index: number, partial: Partial<TaskResult>) => void;
+  /** Exposes each task's live runner (for mid-run steering). Re-fires per retry attempt. */
+  onRunnerCreated?: (index: number, runner: ChildRunner) => void;
+  /** Wrap-up grace turns after budget breach (per-spec graceTurns overrides). */
+  graceTurns?: number;
+  /** Stall watchdog windows (0 disables). */
+  stallAfterMs?: number;
+  stallKillAfterMs?: number;
+  /** Default extra attempts on transient failures (per-spec maxRetries overrides). */
+  maxRetries?: number;
+}
+
+/**
+ * Transient failures are infrastructure problems, not task problems: the same
+ * spec is safe to retry without duplicating side effects because no meaningful
+ * work happened (queued timeout) or the child died from environment causes
+ * (stall, provider error, spawn error, unexpected signal).
+ *
+ * Never retried: real task failures (nonzero exit with complete protocol),
+ * cancellations, budget stops, and running timeouts (work may be half-done).
+ */
+export function isTransientFailure(result: TaskResult): boolean {
+  if (result.state === "timeout" && result.timeoutPhase === "queued") return true;
+  if (result.stopReason === "stalled") return true;
+  if (result.stopReason === "spawn_error") return true;
+  // Provider/stream errors: stopReason "error" comes from provider-reported
+  // failure or the fatal RPC path; both are retry-with-fallback candidates.
+  if (result.state === "failed" && ["error", "protocol_error", "unexpected_signal"].includes(result.stopReason ?? "")) return true;
+  return false;
 }
 
 export interface OrchestratedRun {
@@ -23,8 +58,13 @@ export interface OrchestratedRun {
 
 function aggregateState(results: TaskResult[]): RunState {
   if (results.every((r) => r.state === "completed")) return "completed";
-  if (results.some((r) => r.state === "completed")) return "partial";
+  // Budget-stopped / truncated tasks ("partial") carry useful output.
+  if (results.some((r) => r.state === "completed" || r.state === "partial")) return "partial";
   if (results.every((r) => r.state === "cancelled")) return "cancelled";
+  if (results.every((r) => r.state === "timeout" || r.state === "cancelled")) return "timeout";
+  if (results.some((r) => r.state === "timeout") && results.every((r) => ["timeout", "cancelled", "failed"].includes(r.state))) {
+    return results.every((r) => r.state === "timeout") ? "timeout" : "failed";
+  }
   return "failed";
 }
 
@@ -63,6 +103,10 @@ export async function runTasks(
         const handle = await worktrees.create(spec.cwd || process.cwd(), spec.task.slice(0, 20), options.signal);
         handles[index] = handle;
         spec.cwd = handle.cwd;
+        // Announce the worktree immediately so live runs can shield it from GC sweeps.
+        options.onTaskProgress?.(index, {
+          worktree: { cwd: handle.cwd, branch: handle.branch, baseCommit: handle.baseCommit, changed: false },
+        });
       }
       prepared.push(spec);
     }
@@ -87,7 +131,7 @@ export async function runTasks(
         canWrite: spec.canWrite,
         outputFile: spec.output,
         outputMode: spec.outputMode,
-        protocol: { headerSeen: false, assistantEndSeen: false, agentEndSeen: false, validEvents: 0, parseErrors: 0 },
+        protocol: { headerSeen: false, assistantEndSeen: false, agentEndSeen: false, agentSettledSeen: false, validEvents: 0, parseErrors: 0 },
       }));
       return { mode: specs.length > 1 ? "parallel" : "single", results, state: "cancelled", summary: "Subagent run cancelled during setup" };
     }
@@ -96,15 +140,67 @@ export async function runTasks(
 
   const runOne = async (index: number): Promise<TaskResult> => {
     const spec = prepared[index]!;
-    const runner = new ChildRunner(
-      semaphore,
-      options.getPiCommand,
-      options.sessionDir,
-      (partial) => options.onTaskProgress?.(index, partial),
-    );
-    const result = await runner.run(spec, options.signal);
+    // Per-task durable id stays unique under a multi-task run by appending index.
+    const taskRunId = options.runId
+      ? (specs.length > 1 ? `${options.runId}:${index}` : options.runId)
+      : undefined;
+
+    // Retry with model fallback on transient failures. Attempt N uses the
+    // N-1th fallback model (attempt 1 = primary). Usage accumulates across
+    // attempts so the cost ledger reflects everything billed.
+    const fallbacks = spec.fallbackModels ?? [];
+    const maxRetries = spec.maxRetries ?? options.maxRetries ?? defaultConfig.maxRetries;
+    // Providing fallback models implies wanting them all tried; otherwise
+    // maxRetries bounds same-model retries.
+    const maxAttempts = 1 + Math.max(maxRetries, fallbacks.length);
+    const attemptedModels: string[] = [];
+    let priorUsage: ReturnType<typeof addUsage> | undefined;
+    let result!: TaskResult;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const model = attempt === 1 ? spec.model : (fallbacks[attempt - 2] ?? spec.model);
+      if (model) attemptedModels.push(model);
+      const attemptSpec: TaskSpec = { ...spec, model };
+      const runner = new ChildRunner(
+        semaphore,
+        options.getPiCommand ?? createGetPiCommand(),
+        options.sessionDir,
+        (partial) => options.onTaskProgress?.(index, {
+          ...partial,
+          attempts: attempt > 1 ? attempt : undefined,
+          usage: partial.usage && priorUsage ? addUsage(priorUsage, partial.usage) : partial.usage,
+        }),
+        options.killGraceMs,
+        options.locks,
+        taskRunId,
+        options.parentSessionKey,
+        undefined,
+        { graceTurns: options.graceTurns, stallAfterMs: options.stallAfterMs, stallKillAfterMs: options.stallKillAfterMs },
+      );
+      options.onRunnerCreated?.(index, runner);
+      result = await runner.run(attemptSpec, options.signal);
+      if (priorUsage) result.usage = addUsage(priorUsage, result.usage);
+
+      const canRetry = attempt < maxAttempts && !options.signal?.aborted && isTransientFailure(result);
+      if (!canRetry) break;
+      priorUsage = result.usage;
+      const nextModel = fallbacks[attempt - 1];
+      options.onTaskProgress?.(index, {
+        state: "queued",
+        attempts: attempt + 1,
+        liveText: `Attempt ${attempt} ${result.stopReason ?? result.state}; retrying${nextModel ? ` on ${nextModel}` : ""}…`,
+      });
+    }
+
+    if (attemptedModels.length > 1) {
+      result.attempts = attemptedModels.length;
+      result.attemptedModels = attemptedModels;
+      if (result.errorMessage && (result.state === "failed" || result.state === "timeout")) {
+        result.errorMessage += ` (after ${attemptedModels.length} attempts: ${attemptedModels.join(" → ")})`;
+      }
+    }
     result.index = index;
-    result.label = `task-${index + 1}`;
+    result.label = spec.label || `task-${index + 1}`;
     result.outputMode = spec.outputMode;
 
     try {
@@ -117,6 +213,8 @@ export async function runTasks(
     const handle = handles[index];
     if (handle) {
       try {
+        // Finalize even on cancellation: it either preserves changed work or
+        // removes an unchanged worktree, and both are quick local git calls.
         const final = await worktrees.finalize(handle);
         if (final.changed) {
           result.worktree = {

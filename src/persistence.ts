@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import type { SubagentConfig } from "./config.js";
-import type { RunMode, RunSnapshot, RunState, TaskProfile, UsageStats } from "./types.js";
+import type { ChildProcessIdentity, RunMode, RunSnapshot, RunState, TaskProfile, TimeoutPhase, UsageStats } from "./types.js";
 import { emptyUsage } from "./types.js";
 
 export const RUN_ENTRY_TYPE = "subagent-run-v1";
@@ -18,6 +18,7 @@ export interface PersistedResult {
   state: RunState;
   exitCode: number | null;
   stopReason?: string;
+  timeoutPhase?: TimeoutPhase;
   errorMessage?: string;
   usage: UsageStats;
   model?: string;
@@ -28,8 +29,17 @@ export interface PersistedResult {
   outputMode?: "inline" | "file-only";
   worktree?: { cwd: string; branch: string; baseCommit: string; changed: boolean; diffSummary?: string };
   sessionId?: string;
+  process?: ChildProcessIdentity;
   finalOutput?: string;
   transcript?: string;
+  /** Budget-stopped child that wrapped up gracefully within its grace turns. */
+  wrappedUp?: boolean;
+  /** Set while no protocol activity has been seen for the stall window. */
+  stalledSince?: number;
+  /** Total attempts including retries (present when > 1). */
+  attempts?: number;
+  /** Models tried across attempts, in order. */
+  attemptedModels?: string[];
 }
 
 export interface PersistenceEventData {
@@ -40,6 +50,7 @@ export interface PersistenceEventData {
   taskPreviews?: string[];
   summary?: string;
   delivered?: boolean;
+  resumeBlocked?: boolean;
   results?: PersistedResult[];
   resultIndex?: number;
   childSessionId?: string;
@@ -58,9 +69,25 @@ export interface PersistenceEvent {
 }
 
 function isRunState(value: unknown): value is RunState {
-  return ["queued", "running", "completed", "partial", "failed", "cancelled", "lost"].includes(
+  return ["queued", "running", "completed", "partial", "failed", "cancelled", "lost", "timeout"].includes(
     String(value),
   );
+}
+
+function isTimeoutPhase(value: unknown): value is TimeoutPhase {
+  return ["queued", "starting", "running", "cancelling"].includes(String(value));
+}
+
+function normalizeProcess(value: unknown): ChildProcessIdentity | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const p = value as Partial<ChildProcessIdentity>;
+  if (typeof p.pid !== "number" || !Number.isFinite(p.pid) || p.pid <= 0) return undefined;
+  return {
+    pid: p.pid,
+    startTime: typeof p.startTime === "number" && Number.isFinite(p.startTime) ? p.startTime : 0,
+    pgid: typeof p.pgid === "number" && Number.isFinite(p.pgid) ? p.pgid : undefined,
+    hostname: typeof p.hostname === "string" ? p.hostname : undefined,
+  };
 }
 
 function isRunMode(value: unknown): value is RunMode {
@@ -105,6 +132,7 @@ function normalizeResult(value: unknown): PersistedResult | undefined {
     state: isRunState(r.state) ? r.state : "running",
     exitCode: typeof r.exitCode === "number" || r.exitCode === null ? r.exitCode : null,
     stopReason: typeof r.stopReason === "string" ? r.stopReason : undefined,
+    timeoutPhase: isTimeoutPhase(r.timeoutPhase) ? r.timeoutPhase : undefined,
     errorMessage: typeof r.errorMessage === "string" ? utf8Prefix(r.errorMessage, 2_000) : undefined,
     usage: normalizeUsage(r.usage),
     model: typeof r.model === "string" ? r.model : undefined,
@@ -121,8 +149,15 @@ function normalizeResult(value: unknown): PersistedResult | undefined {
         ? { ...r.worktree, changed: r.worktree.changed === true }
         : undefined,
     sessionId: typeof r.sessionId === "string" ? r.sessionId : undefined,
+    process: normalizeProcess(r.process),
     finalOutput: typeof r.finalOutput === "string" ? utf8Prefix(r.finalOutput, 16_384) : undefined,
     transcript: typeof r.transcript === "string" ? utf8Prefix(r.transcript, 32_768) : undefined,
+    wrappedUp: r.wrappedUp === true ? true : undefined,
+    stalledSince: typeof r.stalledSince === "number" && Number.isFinite(r.stalledSince) ? r.stalledSince : undefined,
+    attempts: typeof r.attempts === "number" && Number.isInteger(r.attempts) && r.attempts > 1 ? r.attempts : undefined,
+    attemptedModels: Array.isArray(r.attemptedModels)
+      ? r.attemptedModels.filter((m): m is string => typeof m === "string").slice(0, 10)
+      : undefined,
   };
 }
 
@@ -202,11 +237,13 @@ export class PersistenceLayer {
           startedAt: event.timestamp || Date.now(),
           taskPreviews: [],
           delivered: false,
+          resumeBlocked: false,
           results: [],
         };
       }
 
       const d = event.data;
+      if (typeof d.resumeBlocked === "boolean") snapshot.resumeBlocked = d.resumeBlocked;
       if (isRunMode(d.mode)) snapshot.mode = d.mode;
       if (isRunState(d.state)) snapshot.state = d.state;
       if (typeof d.startedAt === "number") snapshot.startedAt = d.startedAt;
@@ -232,11 +269,18 @@ export class PersistenceLayer {
 
     for (const [id, snapshot] of snapshots) {
       if (snapshot.state === "running" || snapshot.state === "queued") {
+        // "lost" means ownership cannot be proven after a parent disruption.
+        // Orphan reconcile (ProcessLockManager) must have run before callers
+        // consider the session safe to resume; rebuild keeps resumeBlocked set
+        // until a later reconciler clears it.
         snapshots.set(id, {
           ...snapshot,
           state: "lost",
           endedAt: Date.now(),
-          summary: snapshot.summary || "Run was interrupted before the parent session completed.",
+          resumeBlocked: true,
+          summary:
+            snapshot.summary ||
+            "Run ownership was lost (parent interrupted). Resume is blocked until orphan reconciliation confirms the child is dead.",
         });
       }
     }
@@ -248,11 +292,34 @@ export class PersistenceLayer {
     this.persist(id, sessionKey, "delivered", { delivered: true });
   }
 
-  /** Non-destructive planner. Filesystem scanning/deletion is intentionally outside persistence. */
-  planRetention(referencedSessionIds: Set<string>): { keep: string[]; candidates: string[] } {
-    if (!this.config.sessionRetentionDays || this.config.sessionRetentionDays <= 0) {
-      return { keep: Array.from(referencedSessionIds), candidates: [] };
+  /** All child session ids referenced by any run event on the active branch. */
+  referencedSessionIds(): Set<string> {
+    const ids = new Set<string>();
+    for (const entry of this.adapter.getEntries()) {
+      const event = unwrapEvent(entry);
+      if (!event) continue;
+      if (typeof event.data.childSessionId === "string") ids.add(event.data.childSessionId);
+      if (Array.isArray(event.data.results)) {
+        for (const result of event.data.results) {
+          const sessionId = (result as Partial<PersistedResult>)?.sessionId;
+          if (typeof sessionId === "string" && sessionId) ids.add(sessionId);
+        }
+      }
     }
-    return { keep: Array.from(referencedSessionIds), candidates: [] };
+    return ids;
+  }
+
+  /**
+   * Non-destructive planner. Filesystem scanning/deletion is intentionally
+   * outside persistence (see maintenance.ts). "keep" is the union of caller
+   * references and every child session referenced on the active branch.
+   */
+  planRetention(referencedSessionIds: Set<string>): { keep: string[]; candidates: string[] } {
+    const keep = new Set([...referencedSessionIds, ...this.referencedSessionIds()]);
+    if (!this.config.sessionRetentionDays || this.config.sessionRetentionDays <= 0) {
+      return { keep: [...keep], candidates: [] };
+    }
+    // Candidates are resolved by the filesystem sweep; the planner only fixes the keep set.
+    return { keep: [...keep], candidates: [] };
   }
 }

@@ -1,5 +1,29 @@
+import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { TaskProfile } from "./types.js";
+
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+
+/**
+ * Per-profile defaults applied when a task omits the field. Explicit request
+ * values always win; profile defaults beat parent-session inheritance for
+ * model/thinking so users can e.g. route all explore tasks to a cheap model.
+ */
+export interface TaskDefaults {
+  model?: string;
+  thinking?: ThinkingLevel;
+  maxTurns?: number;
+  maxCost?: number;
+  timeoutMs?: number;
+  /** Ordered backup models tried on transient provider failures. */
+  fallbackModels?: string[];
+  /** Extra attempts on transient failures. */
+  maxRetries?: number;
+}
+
+export type TaskDefaultsByProfile = Partial<Record<TaskProfile, TaskDefaults>>;
 
 export interface SubagentConfig {
   maxTasksPerRun: number;
@@ -11,8 +35,38 @@ export interface SubagentConfig {
   maxDetailsTextBytes: number;
   maxCompletedInMemory: number;
   maxDepth: number;
+  /** Grace period between SIGTERM and SIGKILL for child process trees. */
+  killGraceMs: number;
   sessionDir: string;
+  /** Durable root for subagent git worktrees (never a purgeable tmpdir). */
+  worktreeDir: string;
+  /** Durable root for machine-wide locks, slots, and run process records. */
+  lockDir: string;
+  /**
+   * Machine-wide concurrent child process cap across every Pi parent process.
+   * 0 disables the global limiter (per-session maxActiveProcesses still applies).
+   */
+  maxGlobalActive: number;
+  /** Days after which unchanged, orphaned worktrees are swept. 0 disables. */
+  worktreeRetentionDays: number;
+  /** Days after which unreferenced child session files are swept. Unset/0 disables. */
   sessionRetentionDays?: number;
+  /** Days after which terminal run process records / dead locks are swept. */
+  lockRetentionDays: number;
+  /** Per-profile task defaults (model, thinking, budgets) applied when a request omits them. */
+  taskDefaults?: TaskDefaultsByProfile;
+  /**
+   * Wrap-up grace turns after a max_turns/max_cost breach: the child is steered
+   * to produce a final answer and given this many extra turns before SIGTERM.
+   * 0 restores the old immediate-stop behavior.
+   */
+  graceTurns: number;
+  /** Milliseconds of protocol silence before a running child is flagged as stalled. 0 disables. */
+  stallAfterMs: number;
+  /** Additional silence after the stall flag before the child is killed (feeds retry). 0 disables kill. */
+  stallKillAfterMs: number;
+  /** Default extra attempts on transient failures (queued timeout, stall, provider error). */
+  maxRetries: number;
 }
 
 export const defaultConfig: SubagentConfig = {
@@ -25,5 +79,132 @@ export const defaultConfig: SubagentConfig = {
   maxDetailsTextBytes: 10 * 1024,
   maxCompletedInMemory: 20,
   maxDepth: 2,
+  killGraceMs: 3_000,
   sessionDir: path.join(os.homedir(), ".pi", "subagent-sessions"),
+  worktreeDir: path.join(os.homedir(), ".pi", "subagent-worktrees"),
+  lockDir: path.join(os.homedir(), ".pi", "subagent-locks"),
+  maxGlobalActive: 16,
+  worktreeRetentionDays: 7,
+  lockRetentionDays: 7,
+  graceTurns: 2,
+  stallAfterMs: 90_000,
+  stallKillAfterMs: 90_000,
+  maxRetries: 1,
 };
+
+/** User-facing config file. Env vars override file values; both override defaults. */
+export const CONFIG_FILE = path.join(os.homedir(), ".pi", "subagent.json");
+
+function positiveNumber(value: unknown, min = 1): number | undefined {
+  const parsed = typeof value === "string" ? Number(value) : value;
+  return typeof parsed === "number" && Number.isFinite(parsed) && parsed >= min ? parsed : undefined;
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function prune<T extends object>(value: Partial<T>): Partial<T> {
+  return Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined)) as Partial<T>;
+}
+
+function sanitizeTaskDefaults(raw: unknown): TaskDefaults | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const value = raw as Record<string, unknown>;
+  const thinking = typeof value.thinking === "string" && (THINKING_LEVELS as readonly string[]).includes(value.thinking)
+    ? (value.thinking as ThinkingLevel)
+    : undefined;
+  const fallbackModels = Array.isArray(value.fallbackModels)
+    ? value.fallbackModels.map(nonEmptyString).filter((model): model is string => !!model)
+    : undefined;
+  const defaults = prune<TaskDefaults>({
+    model: nonEmptyString(value.model),
+    thinking,
+    maxTurns: positiveNumber(value.maxTurns),
+    maxCost: positiveNumber(value.maxCost, 0),
+    timeoutMs: positiveNumber(value.timeoutMs),
+    fallbackModels: fallbackModels?.length ? fallbackModels : undefined,
+    maxRetries: positiveNumber(value.maxRetries, 0),
+  });
+  return Object.keys(defaults).length ? defaults : undefined;
+}
+
+function sanitizeTaskDefaultsByProfile(raw: unknown): TaskDefaultsByProfile | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const value = raw as Record<string, unknown>;
+  const result: TaskDefaultsByProfile = {};
+  for (const profile of ["explore", "review", "general"] as const) {
+    const defaults = sanitizeTaskDefaults(value[profile]);
+    if (defaults) result[profile] = defaults;
+  }
+  return Object.keys(result).length ? result : undefined;
+}
+
+/** Validate untrusted JSON overrides field-by-field; unknown keys are dropped. */
+export function sanitizeConfigOverrides(raw: unknown): Partial<SubagentConfig> {
+  if (!raw || typeof raw !== "object") return {};
+  const value = raw as Record<string, unknown>;
+  return prune<SubagentConfig>({
+    taskDefaults: sanitizeTaskDefaultsByProfile(value.taskDefaults),
+    maxTasksPerRun: positiveNumber(value.maxTasksPerRun),
+    maxActiveProcesses: positiveNumber(value.maxActiveProcesses),
+    maxQueuedTasks: positiveNumber(value.maxQueuedTasks, 0),
+    defaultTimeoutMs: positiveNumber(value.defaultTimeoutMs),
+    maxResultBytes: positiveNumber(value.maxResultBytes, 1024),
+    maxResultLines: positiveNumber(value.maxResultLines, 10),
+    maxDetailsTextBytes: positiveNumber(value.maxDetailsTextBytes, 256),
+    maxCompletedInMemory: positiveNumber(value.maxCompletedInMemory),
+    maxDepth: positiveNumber(value.maxDepth, 0),
+    killGraceMs: positiveNumber(value.killGraceMs, 100),
+    sessionDir: nonEmptyString(value.sessionDir),
+    worktreeDir: nonEmptyString(value.worktreeDir),
+    lockDir: nonEmptyString(value.lockDir),
+    maxGlobalActive: positiveNumber(value.maxGlobalActive, 0),
+    worktreeRetentionDays: positiveNumber(value.worktreeRetentionDays, 0),
+    sessionRetentionDays: positiveNumber(value.sessionRetentionDays, 0),
+    lockRetentionDays: positiveNumber(value.lockRetentionDays, 0),
+    graceTurns: positiveNumber(value.graceTurns, 0),
+    stallAfterMs: positiveNumber(value.stallAfterMs, 0),
+    stallKillAfterMs: positiveNumber(value.stallKillAfterMs, 0),
+    maxRetries: positiveNumber(value.maxRetries, 0),
+  });
+}
+
+export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Partial<SubagentConfig> {
+  return prune<SubagentConfig>({
+    maxTasksPerRun: positiveNumber(env.PI_SUBAGENT_MAX_TASKS),
+    maxActiveProcesses: positiveNumber(env.PI_SUBAGENT_MAX_ACTIVE),
+    maxQueuedTasks: positiveNumber(env.PI_SUBAGENT_MAX_QUEUED, 0),
+    defaultTimeoutMs: positiveNumber(env.PI_SUBAGENT_TIMEOUT_MS),
+    maxDepth: positiveNumber(env.PI_SUBAGENT_MAX_DEPTH, 0),
+    killGraceMs: positiveNumber(env.PI_SUBAGENT_KILL_GRACE_MS, 100),
+    sessionDir: nonEmptyString(env.PI_SUBAGENT_SESSION_DIR),
+    worktreeDir: nonEmptyString(env.PI_SUBAGENT_WORKTREE_DIR),
+    lockDir: nonEmptyString(env.PI_SUBAGENT_LOCK_DIR),
+    maxGlobalActive: positiveNumber(env.PI_SUBAGENT_MAX_GLOBAL_ACTIVE, 0),
+    worktreeRetentionDays: positiveNumber(env.PI_SUBAGENT_WORKTREE_RETENTION_DAYS, 0),
+    sessionRetentionDays: positiveNumber(env.PI_SUBAGENT_SESSION_RETENTION_DAYS, 0),
+    lockRetentionDays: positiveNumber(env.PI_SUBAGENT_LOCK_RETENTION_DAYS, 0),
+    graceTurns: positiveNumber(env.PI_SUBAGENT_GRACE_TURNS, 0),
+    stallAfterMs: positiveNumber(env.PI_SUBAGENT_STALL_AFTER_MS, 0),
+    stallKillAfterMs: positiveNumber(env.PI_SUBAGENT_STALL_KILL_AFTER_MS, 0),
+    maxRetries: positiveNumber(env.PI_SUBAGENT_MAX_RETRIES, 0),
+  });
+}
+
+/** defaults ← file overrides ← env overrides. Pure; suitable for tests. */
+export function loadConfig(
+  fileOverrides: Partial<SubagentConfig> = {},
+  env: NodeJS.ProcessEnv = process.env,
+): SubagentConfig {
+  return { ...defaultConfig, ...prune(fileOverrides), ...configFromEnv(env) };
+}
+
+/** Read + sanitize the optional user config file. Missing or invalid files yield {}. */
+export async function readConfigFile(file = CONFIG_FILE): Promise<Partial<SubagentConfig>> {
+  try {
+    return sanitizeConfigOverrides(JSON.parse(await fs.readFile(file, "utf8")));
+  } catch {
+    return {};
+  }
+}

@@ -83,12 +83,20 @@ describe('UI Models', () => {
     adapter.getActiveRuns = () => [runningParallel];
     const model = new SubagentsUIModel(adapter);
 
-    const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => '**' + t + '**', muted: (t: string) => t, accent: (t: string) => t, toolTitle: (t: string) => t, dim: (t: string) => t, toolOutput: (t: string) => t, success: (t: string) => t, warning: (t: string) => t, error: (t: string) => t } as any;
+    const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => '**' + t + '**' } as any;
 
-    // Test render from format with live parallel - covers expanded live parallel + truncation
-    const opts: format.RenderOptions = { expanded: true, theme, width: 80, liveText: 'thinking about next step with spinner...', spinnerFrame: 2 };
-    const rendered = format.renderResult(runningParallel, opts);
-    expect(rendered.some((l: string) => l.includes('thinking') || l.includes('parallel') || l.includes('thinking about next step'))).toBe(true);
+    // Live parallel view renders one line per task with live activity, expanded.
+    const view: format.InlineRunView = {
+      mode: 'parallel',
+      state: 'running' as RunState,
+      startedAt: runningParallel.startedAt,
+      results: [
+        { label: 't1', state: 'running' as RunState, usage: { turns: 0, input: 0, output: 0, cost: 0 }, finalOutput: 'thinking about next step with spinner...' },
+        { label: 't2', state: 'queued' as RunState, usage: { turns: 0, input: 0, output: 0, cost: 0 } },
+      ],
+    };
+    const rendered = format.renderRunLines(view, { expanded: true, theme, width: 80, isPartial: true, spinnerFrame: 2 });
+    expect(rendered.some((l: string) => l.includes('thinking') || l.includes('t1'))).toBe(true);
 
     // Timer/disposal covered in component but model simulates
     expect(model.isRunning()).toBe(true);

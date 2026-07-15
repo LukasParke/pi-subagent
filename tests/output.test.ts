@@ -8,7 +8,7 @@ function task(text: string, extra: Partial<TaskResult> = {}): TaskResult {
   return {
     label: "t", task: "x", state: "completed", exitCode: 0, stderr: "", usage: emptyUsage(),
     messages: [{ role: "assistant", content: [{ type: "text", text: text.slice(0, Math.ceil(text.length / 2)) }, { type: "text", text: text.slice(Math.ceil(text.length / 2)) }] } as any],
-    protocol: { headerSeen: true, assistantEndSeen: true, agentEndSeen: true, validEvents: 1, parseErrors: 0 },
+    protocol: { headerSeen: true, assistantEndSeen: true, agentEndSeen: true, agentSettledSeen: true, validEvents: 1, parseErrors: 0 },
     ...extra,
   };
 }

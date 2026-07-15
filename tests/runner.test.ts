@@ -91,18 +91,132 @@ describe("ChildRunner", () => {
     expect(result.state).toBe("cancelled");
   });
 
-  it("timeout terminates with timeout stopReason", async () => {
+  it("timeout during run marks timeout with phase=running", async () => {
     process.env.FAKE_PI_MODE = "signal";
     const result = await runner.run({ ...defaultSpec, timeoutMs: 40 });
     expect(result.stopReason).toBe("timeout");
-    expect(result.state).toBe("failed");
+    expect(result.state).toBe("timeout");
+    expect(result.timeoutPhase).toBe("running");
   });
 
-  it("budget termination after usage captured (maxTurns)", async () => {
+  it("budget termination preserves partial work (maxTurns, graceTurns=0)", async () => {
     process.env.FAKE_PI_MODE = "success";
-    const result = await runner.run({ ...defaultSpec, maxTurns: 0 });
+    const result = await runner.run({ ...defaultSpec, maxTurns: 0, graceTurns: 0 });
     expect(result.stopReason).toBe("max_turns");
     expect(result.usage.turns).toBeGreaterThan(0);
+    // Budget stops are expected outcomes: completed turns are partial success, not failure.
+    expect(result.state).toBe("partial");
+    expect(result.errorMessage).toMatch(/budget/i);
+  });
+
+  it("budget breach steers a wrap-up and marks wrappedUp when the child concludes in grace", async () => {
+    process.env.FAKE_PI_MODE = "wrap-up";
+    const result = await runner.run({ ...defaultSpec, maxTurns: 2, graceTurns: 3, timeoutMs: 8_000 });
+    expect(result.state).toBe("partial");
+    expect(result.stopReason).toBe("max_turns");
+    expect(result.wrappedUp).toBe(true);
+    expect(result.liveText).toContain("FINAL WRAP-UP");
+    expect(result.errorMessage).toMatch(/wrapped up gracefully/i);
+  });
+
+  it("budget breach hard-stops after grace turns when the child keeps working", async () => {
+    // steer-echo never sees the wrap-up because it only echoes; use success mode
+    // with maxTurns 0 and grace 0 covered above. Here: wrap-up child that ignores
+    // the steer is emulated by a tiny grace window on the multi-turn script.
+    process.env.FAKE_PI_MODE = "wrap-up";
+    process.env.FAKE_PI_IGNORE_STEER = "1";
+    const result = await runner.run({ ...defaultSpec, maxTurns: 1, graceTurns: 1, timeoutMs: 8_000 });
+    expect(result.state).toBe("partial");
+    expect(result.stopReason).toBe("max_turns");
+    expect(result.wrappedUp).toBeUndefined();
+    delete process.env.FAKE_PI_IGNORE_STEER;
+  });
+
+  it("stall watchdog flags then kills a silent child; completed turns stay partial", async () => {
+    process.env.FAKE_PI_MODE = "stall";
+    const stallRunner = new ChildRunner(
+      semaphore,
+      () => getFakePiCommand(),
+      "/tmp/test-sessions-pi-subagent",
+      onCheckpoint,
+      50,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { stallAfterMs: 300, stallKillAfterMs: 300 },
+    );
+    const result = await stallRunner.run({ ...defaultSpec, timeoutMs: 30_000 });
+    expect(result.stopReason).toBe("stalled");
+    expect(result.state).toBe("partial"); // one message arrived before silence
+    expect(result.errorMessage).toMatch(/no protocol activity/i);
+    // The stall flag surfaced through checkpoints before the kill.
+    expect(checkpointCalls.some((c: any) => c.stalledSince !== undefined)).toBe(true);
+  });
+
+  it("stall watchdog stays quiet for an active child", async () => {
+    process.env.FAKE_PI_MODE = "pause-after-message";
+    process.env.FAKE_PI_PAUSE_MS = "300";
+    const activeRunner = new ChildRunner(
+      semaphore,
+      () => getFakePiCommand(),
+      "/tmp/test-sessions-pi-subagent",
+      onCheckpoint,
+      50,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      // Stall window longer than the pause: must never trigger.
+      { stallAfterMs: 5_000, stallKillAfterMs: 1_000 },
+    );
+    const result = await activeRunner.run({ ...defaultSpec, timeoutMs: 10_000 });
+    expect(result.state).toBe("completed");
+    expect(result.stopReason).not.toBe("stalled");
+    delete process.env.FAKE_PI_PAUSE_MS;
+  });
+
+  it("timeout budget includes semaphore queue time and reports phase=queued", async () => {
+    process.env.FAKE_PI_MODE = "signal";
+    const tight = new Semaphore(1, 10);
+    const fake = getFakePiCommand();
+    const makeRunner = () => new ChildRunner(tight, () => fake, "/tmp/test-sessions-pi-subagent", undefined, 50);
+    const hog = makeRunner().run({ ...defaultSpec, timeoutMs: 400 });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    // Second task queues behind the hog and must time out while still queued.
+    const queued = await makeRunner().run({ ...defaultSpec, timeoutMs: 60 });
+    expect(queued.stopReason).toBe("timeout");
+    expect(queued.state).toBe("timeout");
+    expect(queued.timeoutPhase).toBe("queued");
+    expect(queued.errorMessage).toMatch(/never started/i);
+    await hog;
+  });
+
+  it("preserves partial output when child crashes after assistant turn", async () => {
+    process.env.FAKE_PI_MODE = "partial-crash";
+    const result = await runner.run(defaultSpec);
+    expect(result.state).toBe("partial");
+    expect(result.liveText).toMatch(/Hello/);
+  });
+
+  it("completes on agent_settled after a willRetry agent_end", async () => {
+    process.env.FAKE_PI_MODE = "retry";
+    const result = await runner.run(defaultSpec);
+    expect(result.state).toBe("completed");
+    expect(result.protocol.agentSettledSeen).toBe(true);
+  });
+
+  it("completes on legacy agent_end without agent_settled", async () => {
+    process.env.FAKE_PI_MODE = "legacy-no-settled";
+    const result = await runner.run(defaultSpec);
+    expect(result.state).toBe("completed");
+  });
+
+  it("builds an incremental transcript during the run", async () => {
+    process.env.FAKE_PI_MODE = "success";
+    const result = await runner.run(defaultSpec);
+    expect(result.transcript).toContain("Hello");
+    expect(result.transcript).toContain("world!");
   });
 
   it("performs temp prompt cleanup", async () => {
@@ -142,5 +256,34 @@ describe("ChildRunner", () => {
     const result = await runner.run(defaultSpec);
     expect(result.state).toBe("completed");
     expect(result.protocol.agentEndSeen).toBe(true);
+  });
+
+  it("steers a running child mid-run over the stdin command channel", async () => {
+    process.env.FAKE_PI_MODE = "steer-echo";
+    const promise = runner.run({ ...defaultSpec, timeoutMs: 5_000 });
+    // Wait until the child is live (first message emitted), then steer.
+    await vi.waitFor(() => {
+      expect(runner.steer("focus on the tests")).toBe(true);
+    }, { timeout: 3_000 });
+    const result = await promise;
+    expect(result.state).toBe("completed");
+    expect(result.liveText).toContain("steered: focus on the tests");
+  });
+
+  it("steer returns false when no child is running", () => {
+    expect(runner.steer("too late")).toBe(false);
+  });
+
+  it("fails fast when the child rejects the prompt", async () => {
+    process.env.FAKE_PI_MODE = "prompt-rejected";
+    const result = await runner.run({ ...defaultSpec, timeoutMs: 5_000 });
+    expect(result.state).toBe("failed");
+    expect(result.errorMessage).toMatch(/prompt rejected/i);
+  });
+
+  it("uses the spec label on results", async () => {
+    process.env.FAKE_PI_MODE = "success";
+    const result = await runner.run({ ...defaultSpec, label: "Audit auth" });
+    expect(result.label).toBe("Audit auth");
   });
 });

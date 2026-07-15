@@ -4,8 +4,8 @@ Pi installs packages from **npm** or **git**. Publishing binds both:
 
 | Source | Install command | Needs |
 |--------|-----------------|-------|
-| npm | `pi install npm:@lukehagar/pi-subagent@0.1.3` | npm publish + `pi-package` keyword |
-| git | `pi install git:github.com/LukasParke/pi-subagent@v0.1.3` | GitHub Release / tag |
+| npm | `pi install npm:@lukehagar/pi-subagent@0.2.0` | npm publish + `pi-package` keyword |
+| git | `pi install git:github.com/LukasParke/pi-subagent@v0.2.0` | GitHub Release / tag |
 | local | `pi install /path/to/pi-subagent` | checkout only |
 
 The [pi.dev package gallery](https://pi.dev/packages) lists npm packages that declare the `pi-package` keyword (already set in `package.json`).
@@ -93,13 +93,13 @@ gh run watch
 
 ```bash
 # npm (gallery / versioned)
-pi install npm:@lukehagar/pi-subagent@0.1.3
+pi install npm:@lukehagar/pi-subagent@0.2.0
 
 # latest npm
 pi install npm:@lukehagar/pi-subagent
 
 # git pin to the release tag
-pi install git:github.com/LukasParke/pi-subagent@v0.1.3
+pi install git:github.com/LukasParke/pi-subagent@v0.2.0
 
 # live main (not a release pin)
 pi install git:github.com/LukasParke/pi-subagent
