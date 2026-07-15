@@ -16,13 +16,13 @@ Pi packages install from **npm**, **git**, or a **local path**:
 ```bash
 # npm (scoped; surfaces on the pi.dev gallery via the pi-package keyword)
 # Note: unscoped "pi-subagent" is rejected by npm as too similar to "pi-sub-agent".
-pi install npm:@parke.dev/pi-subagent@0.3.0
+pi install npm:@parke.dev/pi-subagent@0.3.1
 
 # latest npm
 pi install npm:@parke.dev/pi-subagent
 
 # git pin to a release tag
-pi install git:github.com/LukasParke/pi-subagent@v0.3.0
+pi install git:github.com/LukasParke/pi-subagent@v0.3.1
 
 # live main
 pi install git:github.com/LukasParke/pi-subagent

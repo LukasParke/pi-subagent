@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.1
+
+- Remove `publishConfig.provenance` (it blocked the one-time local bootstrap
+  publish of the new package name; OIDC publishes generate provenance
+  automatically). First release published end-to-end via Trusted Publishing
+  under `@parke.dev`.
+
 ## 0.3.0
 
 ### Structured results
