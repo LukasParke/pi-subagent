@@ -9,7 +9,9 @@ or subagent given only this document and the codebase.
 
 Status legend: `[ ]` not started · `[~]` in progress · `[x]` done
 
-Shipped so far: Phase 1 (structured results) in v0.3.0 — see ROADMAP.md.
+Shipped so far: Phase 1 (structured results) in v0.3.0; phases 2–4 landed
+together and shipped as a single v0.4.0 (the staged v0.4.0/v0.5.0/v0.5.x
+gates below were collapsed — all items met their gates concurrently).
 
 ---
 
