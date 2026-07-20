@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.5.0
+
+### Native Pi cost accounting (pi#6671)
+
+- **Upward**: the tool result that delivers a run (foreground completion or
+  the first `wait`) now carries the run's total provider usage as a native
+  `usage` field. Pi builds after v0.80.10 persist it on the session entry and
+  fold it into the footer cost, `/session` statistics (`Tools/summaries`
+  bucket), and RPC `get_state` totals — resolving the undercount that
+  motivated [pi#6509](https://github.com/earendil-works/pi/issues/6509).
+  Attachment is delivered-flag gated: exactly once per run UUID; status,
+  replayed waits, steer, worktree actions, and plan responses never attach
+  usage. Older Pi hosts silently ignore the field (no minimum version bump).
+- **Downward**: tool-result messages in a child's event stream that carry
+  nested usage (e.g. grandchild subagents on a new-Pi child) now fold into
+  the run's cumulative usage, so `max_cost` budgets and the
+  root/subagent/combined ledger see true subtree spend. Pre-#6671 children
+  never emit the field; behavior there is unchanged.
+- Known native-total gaps documented in COST-ACCOUNTING.md: dismissed-without-
+  wait background runs and failed/lost runs (thrown errors carry no usage)
+  reach only the extension ledger.
+
 ## 0.4.0
 
 ### Agent ecosystem (PLAN phase 2)
