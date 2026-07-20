@@ -48,6 +48,27 @@ if (isMain) {
       process.exit(0);
       return;
     }
+    if (mode === "nested-usage") {
+      // Pi ≥ #6671: toolResult messages may carry nested LLM usage (e.g. a
+      // grandchild subagent). The parent must fold it into cumulative spend.
+      emit(header);
+      emit(message);
+      emit({
+        type: "message_end",
+        message: {
+          role: "toolResult", toolCallId: "call-nested", toolName: "subagent",
+          content: [{ type: "text", text: "grandchild done" }], isError: false, timestamp: Date.now(),
+          usage: {
+            input: 100, output: 40, cacheRead: 10, cacheWrite: 5, totalTokens: 155,
+            cost: { input: 0.002, output: 0.001, cacheRead: 0, cacheWrite: 0, total: 0.003 },
+          },
+        },
+      });
+      emit(agentEnd);
+      emit(agentSettled);
+      process.exit(0);
+      return;
+    }
     if (mode === "truncated" || mode === "retry") {
       // Intermediate agent_end with willRetry, then settle. Used to verify we wait
       // for agent_settled rather than racing agent_end.

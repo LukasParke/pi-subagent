@@ -151,6 +151,51 @@ describe("extension end-to-end wiring", () => {
     await h.handlers.get("session_shutdown")!();
   });
 
+  it("attaches native Pi usage to foreground delivery exactly once", async () => {
+    const h = harness();
+    await h.handlers.get("session_start")!({}, h.ctx);
+    const result = await execute(h, { task: "hello", profile: "explore" });
+    // fake-pi bills 10 in / 5 out / $0.001 per child; Pi ≥ #6671 folds this
+    // usage object into footer, /session, and RPC session totals.
+    expect(result.usage).toEqual({
+      input: 10, output: 5, cacheRead: 0, cacheWrite: 0, reasoning: 1, totalTokens: 15,
+      cost: { input: 0.0004, output: 0.0006, cacheRead: 0, cacheWrite: 0, total: 0.001 },
+    });
+    await h.handlers.get("session_shutdown")!();
+  });
+
+  it("attaches native usage on wait delivery, never on replay or status", async () => {
+    const h = harness();
+    await h.handlers.get("session_start")!({}, h.ctx);
+    process.env.FAKE_PI_DELAY_MS = "80";
+    const started = await execute(h, { task: "async", profile: "explore", async: true });
+    expect(started.usage).toBeUndefined();
+    const id = runId(started.content[0].text);
+    const waited = await execute(h, { action: "wait", id });
+    expect(waited.usage?.cost.total).toBeCloseTo(0.001);
+    expect(waited.usage?.totalTokens).toBe(15);
+    // Replay and status must not re-bill the same run.
+    const duplicate = await execute(h, { action: "wait", id });
+    expect(duplicate.usage).toBeUndefined();
+    const status = await execute(h, { action: "status", id });
+    expect(status.usage).toBeUndefined();
+    await h.handlers.get("session_shutdown")!();
+  });
+
+  it("folds a child's nested toolResult usage into delivered usage and ledger", async () => {
+    const h = harness();
+    await h.handlers.get("session_start")!({}, h.ctx);
+    process.env.FAKE_PI_MODE = "nested-usage";
+    const result = await execute(h, { task: "spawn grandchild", profile: "explore" });
+    // assistant $0.001 (10/5) + grandchild toolResult $0.003 (100/40/10/5).
+    expect(result.usage?.cost.total).toBeCloseTo(0.004);
+    expect(result.usage?.totalTokens).toBe(170);
+    const status = await execute(h, { action: "status" });
+    expect(status.content[0].text).toContain("subagents $0.0040");
+    expect(status.content[0].text).toContain("combined $0.2040");
+    await h.handlers.get("session_shutdown")!();
+  });
+
   it("supports async wait exactly once and streams partial updates", async () => {
     const h = harness();
     await h.handlers.get("session_start")!({}, h.ctx);

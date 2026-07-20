@@ -1,4 +1,4 @@
-import type { Message } from "@earendil-works/pi-ai";
+import type { Message, Usage } from "@earendil-works/pi-ai";
 import type { RunSnapshot, UsageStats } from "./types.js";
 import { emptyUsage } from "./types.js";
 import { RUN_ENTRY_TYPE } from "./persistence.js";
@@ -51,31 +51,93 @@ export function addUsage(...values: Array<Partial<UsageStats> | undefined>): Usa
   }, emptyUsage());
 }
 
-export function usageFromMessage(message: Message | unknown): UsageStats {
-  const msg = message as { role?: string; usage?: any };
-  if (msg?.role !== "assistant" || !msg.usage) return emptyUsage();
-  const usage = msg.usage;
-  const categoryTotal = [usage.cost?.input, usage.cost?.output, usage.cost?.cacheRead, usage.cost?.cacheWrite]
+/**
+ * Untrusted provider usage payload from a child's event stream. Old Pi builds
+ * reported `cost` as a bare number; new ones report a category object.
+ */
+interface ProviderUsageLike {
+  input?: unknown;
+  output?: unknown;
+  cacheRead?: unknown;
+  cacheWrite?: unknown;
+  reasoning?: unknown;
+  totalTokens?: unknown;
+  cost?: number | { input?: unknown; output?: unknown; cacheRead?: unknown; cacheWrite?: unknown; total?: unknown };
+}
+
+/** Shared normalization of Pi's provider `Usage` payload into our aggregate stats. */
+function statsFromProviderUsage(usage: ProviderUsageLike, turns: number, contextTokens: unknown): UsageStats {
+  const cost = typeof usage.cost === "object" && usage.cost !== null ? usage.cost : undefined;
+  const categoryTotal = [cost?.input, cost?.output, cost?.cacheRead, cost?.cacheWrite]
     .reduce((sum: number, value: unknown) => sum + finite(value), 0);
-  const reportedTotal = typeof usage.cost?.total === "number" && Number.isFinite(usage.cost.total) && usage.cost.total >= 0
-    ? usage.cost.total
+  const reportedTotal = typeof cost?.total === "number" && Number.isFinite(cost.total) && cost.total >= 0
+    ? cost.total
     : typeof usage.cost === "number" && Number.isFinite(usage.cost) && usage.cost >= 0
       ? usage.cost
       : categoryTotal;
   return normalizeUsage({
-    input: usage.input,
-    output: usage.output,
-    cacheRead: usage.cacheRead,
-    cacheWrite: usage.cacheWrite,
-    reasoning: usage.reasoning,
+    input: finite(usage.input),
+    output: finite(usage.output),
+    cacheRead: finite(usage.cacheRead),
+    cacheWrite: finite(usage.cacheWrite),
+    reasoning: finite(usage.reasoning),
     cost: reportedTotal,
-    costInput: usage.cost?.input,
-    costOutput: usage.cost?.output,
-    costCacheRead: usage.cost?.cacheRead,
-    costCacheWrite: usage.cost?.cacheWrite,
-    contextTokens: usage.totalTokens,
-    turns: 1,
+    costInput: finite(cost?.input),
+    costOutput: finite(cost?.output),
+    costCacheRead: finite(cost?.cacheRead),
+    costCacheWrite: finite(cost?.cacheWrite),
+    contextTokens: finite(contextTokens),
+    turns,
   });
+}
+
+/** Message-shaped value with an optional usage payload (untrusted stream data). */
+type MessageWithUsage = { role?: unknown; usage?: ProviderUsageLike };
+
+export function usageFromMessage(message: Message | unknown): UsageStats {
+  const msg = message as MessageWithUsage; // structural read of untrusted stream JSON; every field re-validated
+  if (msg?.role !== "assistant" || !msg.usage) return emptyUsage();
+  return statsFromProviderUsage(msg.usage, 1, msg.usage.totalTokens);
+}
+
+/**
+ * Nested LLM usage reported on a toolResult message (Pi ≥ #6671, e.g. a
+ * grandchild subagent's spend). Not a turn; not a context measurement.
+ */
+export function usageFromToolResultMessage(message: Message | unknown): UsageStats {
+  const msg = message as MessageWithUsage; // structural read of untrusted stream JSON; every field re-validated
+  if (msg?.role !== "toolResult" || !msg.usage) return emptyUsage();
+  return statsFromProviderUsage(msg.usage, 0, 0);
+}
+
+/** True when the stats represent any billed work (tokens or cost). */
+export function hasBilledUsage(stats: Partial<UsageStats> | undefined): boolean {
+  const n = normalizeUsage(stats);
+  return n.cost > 0 || n.input + n.output + n.cacheRead + n.cacheWrite > 0;
+}
+
+/**
+ * Convert aggregate stats into Pi's native `Usage` shape for tool-result
+ * accounting (AgentToolResult.usage / tool_result hook). Pi folds the four
+ * token categories plus `cost.total` into footer, /session, and RPC totals.
+ */
+export function toPiUsage(stats: UsageStats): Usage {
+  const n = normalizeUsage(stats);
+  return {
+    input: n.input,
+    output: n.output,
+    cacheRead: n.cacheRead,
+    cacheWrite: n.cacheWrite,
+    ...(n.reasoning ? { reasoning: n.reasoning } : {}),
+    totalTokens: n.input + n.output + n.cacheRead + n.cacheWrite,
+    cost: {
+      input: n.costInput ?? 0,
+      output: n.costOutput ?? 0,
+      cacheRead: n.costCacheRead ?? 0,
+      cacheWrite: n.costCacheWrite ?? 0,
+      total: n.cost,
+    },
+  };
 }
 
 /** Root usage from active-branch session message entries only. */

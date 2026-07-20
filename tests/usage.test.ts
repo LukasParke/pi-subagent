@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { addUsage, buildUsageLedger, rootUsageFromEntries, subagentUsageFromEntries, usageFromMessage } from "../src/usage.js";
+import { addUsage, buildUsageLedger, hasBilledUsage, rootUsageFromEntries, subagentUsageFromEntries, toPiUsage, usageFromMessage, usageFromToolResultMessage } from "../src/usage.js";
 import { RUN_ENTRY_TYPE } from "../src/persistence.js";
 
 const usage = (cost: number, input = 10, output = 5) => ({
@@ -37,6 +37,45 @@ describe("usage ledger", () => {
     expect(result.cost).toBeCloseTo(0.4);
     expect(result.input).toBe(0);
     expect(result.reasoning).toBe(0);
+  });
+
+  it("extracts nested toolResult usage without counting a turn or context", () => {
+    const message = {
+      role: "toolResult", toolCallId: "c1", toolName: "subagent",
+      content: [{ type: "text", text: "done" }], isError: false, timestamp: 1,
+      usage: usage(0.3, 100, 40),
+    };
+    const result = usageFromToolResultMessage(message);
+    expect(result).toMatchObject({ input: 100, output: 40, cost: 0.3, turns: 0, contextTokens: 0 });
+    // Wrong role or missing usage contributes nothing.
+    expect(usageFromToolResultMessage(assistant(0.5))).toMatchObject({ cost: 0, turns: 0 });
+    expect(usageFromToolResultMessage({ role: "toolResult" })).toMatchObject({ cost: 0 });
+  });
+
+  it("converts aggregate stats to Pi's native Usage shape", () => {
+    const stats = addUsage(
+      usageFromMessage(assistant(0.42) as any),
+      usageFromMessage(assistant(0.08) as any),
+    );
+    const pi = toPiUsage(stats);
+    expect(pi).toEqual({
+      input: 20, output: 10, cacheRead: 4, cacheWrite: 2,
+      reasoning: 6, totalTokens: 36,
+      cost: { input: 0.25, output: 0.25, cacheRead: 0, cacheWrite: 0, total: 0.5 },
+    });
+    // Category costs reconcile with the reported total for well-formed input.
+    expect(pi.cost.input + pi.cost.output + pi.cost.cacheRead + pi.cost.cacheWrite).toBeCloseTo(pi.cost.total);
+  });
+
+  it("omits reasoning from converted usage when zero and reports billed-ness", () => {
+    const zero = toPiUsage(addUsage());
+    expect("reasoning" in zero).toBe(false);
+    expect(zero.totalTokens).toBe(0);
+    expect(hasBilledUsage(addUsage())).toBe(false);
+    expect(hasBilledUsage(undefined)).toBe(false);
+    expect(hasBilledUsage(usageFromMessage(assistant(0.01) as any))).toBe(true);
+    // Tokens without cost still count as billed work (zero-cost providers).
+    expect(hasBilledUsage({ input: 5 })).toBe(true);
   });
 
   it("totals root active-branch messages once by entry id", () => {

@@ -369,9 +369,15 @@ Tests use a deterministic `fake-pi` child. No live model calls are required.
 
 `status`, `/subagent-cost`, and the `/subagents` overlay header show separate
 **root**, **subagent**, and **combined** totals based on provider-reported
-usage. The footer stays terse (running/ready counts only) because Pi's native
-footer already reports session cost. Delivery and replay do not double count
-runs. See [docs/COST-ACCOUNTING.md](./docs/COST-ACCOUNTING.md).
+usage. On Pi builds after v0.80.10, delivered runs also report their total
+usage natively on the tool result
+([pi#6671](https://github.com/earendil-works/pi/pull/6671)), so Pi's own
+footer, `/session`, and RPC totals include subagent spend — exactly once per
+run; older Pi hosts ignore the field. Nested usage reported by a child's tool
+results (e.g. grandchild subagents) folds into the run's totals and budgets.
+The extension footer stays terse (running/ready counts only). Delivery and
+replay do not double count runs. See
+[docs/COST-ACCOUNTING.md](./docs/COST-ACCOUNTING.md).
 
 ## Roadmap
 

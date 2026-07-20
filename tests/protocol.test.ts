@@ -97,6 +97,37 @@ describe("ProtocolParser", () => {
     expect(result.usage).toMatchObject({ cost: .033, costInput: .01, costOutput: .02, reasoning: 3, turns: 1 });
   });
 
+  it("folds nested toolResult usage into cumulative run usage", () => {
+    const toolResult = {
+      type: "message_end",
+      message: {
+        role: "toolResult", toolCallId: "c1", toolName: "subagent",
+        content: [{ type: "text", text: "grandchild done" }], isError: false, timestamp: 2,
+        usage: { input: 100, output: 40, cacheRead: 10, cacheWrite: 5, totalTokens: 155, cost: { input: .002, output: .001, cacheRead: 0, cacheWrite: 0, total: .003 } },
+      },
+    };
+    const parser = new ProtocolParser();
+    parser.feed([header, message, toolResult, end, settled].map((value) => JSON.stringify(value)).join("\n") + "\n");
+    const result = parser.finalize(0);
+    expect(result.state).toBe("completed");
+    // assistant (10/5/2/1, $0.033, 1 turn) + nested toolResult (100/40/10/5, $0.003, 0 turns)
+    expect(result.usage).toMatchObject({ input: 110, output: 45, cacheRead: 12, cacheWrite: 6, turns: 1 });
+    expect(result.usage.cost).toBeCloseTo(0.036);
+    // context tokens still track the assistant turn, not the nested tool total.
+    expect(result.usage.contextTokens).toBe(15);
+  });
+
+  it("ignores toolResult messages without usage (pre-#6671 children)", () => {
+    const bare = {
+      type: "message_end",
+      message: { role: "toolResult", toolCallId: "c1", toolName: "bash", content: [{ type: "text", text: "ok" }], isError: false, timestamp: 2 },
+    };
+    const parser = new ProtocolParser();
+    parser.feed([header, message, bare, end, settled].map((value) => JSON.stringify(value)).join("\n") + "\n");
+    const result = parser.finalize(0);
+    expect(result.usage).toMatchObject({ input: 10, output: 5, cost: 0.033, turns: 1 });
+  });
+
   it("rejects oversized single lines without killing the parser", () => {
     const parser = new ProtocolParser();
     const huge = "x".repeat(5 * 1024 * 1024);
