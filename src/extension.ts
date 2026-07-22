@@ -4,6 +4,7 @@ import { constants as fsConstants } from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext, Theme, ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, type Component, type TUI } from "@earendil-works/pi-tui";
+import type { Usage } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
 import { defaultConfig, loadConfig, readConfigFile, type SubagentConfig } from "./config.js";
 import {
@@ -28,9 +29,9 @@ import { ProcessLockManager } from "./process-lock.js";
 import { SessionScopedRunRegistry, snapshotFromLiveRun } from "./registry.js";
 import { SubagentParamsSchema, type SubagentParams } from "./schema.js";
 import { Semaphore } from "./semaphore.js";
-import type { RunSnapshot, TaskResult, TaskSpec } from "./types.js";
+import type { RunSnapshot, TaskResult, TaskSpec, UsageStats } from "./types.js";
 import { emptyUsage } from "./types.js";
-import { buildUsageLedger, formatLedger, type UsageLedger } from "./usage.js";
+import { addUsage, buildUsageLedger, formatLedger, hasBilledUsage, toPiUsage, type UsageLedger } from "./usage.js";
 import { resolveSessionFilePath } from "./transcript.js";
 import { CompletionBatcher, COMPLETION_MESSAGE_TYPE, type CompletionDetails, type CompletionDetailsRun } from "./notifications.js";
 import { describeCatalog, discoverAgents, type AgentDefinition } from "./agents.js";
@@ -348,6 +349,26 @@ function expandHint(): string {
 
 function fail(message: string): never {
   throw new Error(message);
+}
+
+/**
+ * Terminal delivery payload for the subagent tool. On Pi ≥ #6671 the extra
+ * `usage` field is persisted on the tool-result session entry and folded into
+ * the native footer, /session, and RPC session totals; older Pi copies only
+ * content/details and silently ignores it. Callers attach it exactly once per
+ * run by gating on the markDelivered result, mirroring the ledger's dedup.
+ */
+function deliveredResult<TDetails>(
+  text: string,
+  details: TDetails,
+  results: ReadonlyArray<{ usage: UsageStats }>,
+): { content: Array<{ type: "text"; text: string }>; details: TDetails; usage?: Usage } {
+  const total = addUsage(...results.map((result) => result.usage));
+  return {
+    content: [{ type: "text", text }],
+    details,
+    ...(hasBilledUsage(total) ? { usage: toPiUsage(total) } : {}),
+  };
 }
 
 /** Status lines advertising resumable child session ids under a finished run. */
@@ -955,8 +976,10 @@ export default function registerSubagent(pi: ExtensionAPI): void {
         const text = delivered.text || terminal.summary || "(no output)";
         // Locate runs and partial/timeout deliveries still return content; hard
         // failures and “lost with resume blocked” raise so the agent notices.
+        // (Thrown deliveries cannot carry native usage; the extension ledger
+        // still counts them from persisted entries.)
         if (terminal.state === "failed" || terminal.state === "lost") fail(text);
-        return { content: [{ type: "text", text }], details: details(terminal.mode, delivered.cappedResults as any, terminal) };
+        return deliveredResult(text, details(terminal.mode, delivered.cappedResults as any, terminal), terminal.results);
       }
 
       if (validated.planOnly) {
@@ -1142,7 +1165,9 @@ export default function registerSubagent(pi: ExtensionAPI): void {
         return { content: [{ type: "text", text: `Started run ${runId}. You will be notified on completion; use status/wait/cancel with this full id, or open /subagents.` }], details: details(validated.mode as "single" | "parallel", []) };
       }
       const result = await work;
-      runtime.registry.markDelivered(runId, runtime.key);
+      // First delivery wins the native usage attachment: a rare concurrent
+      // wait/dismiss that already consumed this run must not double-bill.
+      const firstDelivery = runtime.registry.markDelivered(runId, runtime.key);
       const delivered = runtime.output.capOutputForDelivery(result.results);
       const text = delivered.text || result.summary;
       const finished = runtime.registry.lookup(runId, runtime.key);
@@ -1151,7 +1176,10 @@ export default function registerSubagent(pi: ExtensionAPI): void {
         : { state: result.state };
       // timeout is reportable content (with timeoutPhase for retry policy), not a hard throw.
       if (result.state === "failed") fail(text);
-      return { content: [{ type: "text", text }], details: details(result.mode, delivered.cappedResults as any, meta) };
+      const resultDetails = details(result.mode, delivered.cappedResults as any, meta);
+      return firstDelivery
+        ? deliveredResult(text, resultDetails, result.results)
+        : { content: [{ type: "text", text }], details: resultDetails };
     },
     renderCall(args, theme, context) {
       // Stable component identity: reuse the previous block and swap content.

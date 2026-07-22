@@ -1,7 +1,7 @@
 import type { Message } from "@earendil-works/pi-ai";
 import type { TaskResult, UsageStats } from "./types.js";
 import { emptyUsage } from "./types.js";
-import { addUsage, usageFromMessage } from "./usage.js";
+import { addUsage, hasBilledUsage, usageFromMessage, usageFromToolResultMessage } from "./usage.js";
 
 export type ProtocolUpdate =
   | { type: "session"; sessionId: string }
@@ -172,6 +172,12 @@ export class ProtocolParser {
         this.errorMessage = message.errorMessage;
         const text = this.textParts(message).join("");
         if (text) this.liveText = text;
+      } else if (message.role === "toolResult") {
+        // Pi ≥ #6671: tool results may carry nested LLM usage (e.g. a
+        // grandchild subagent). Fold it into the run's cumulative spend so
+        // budgets and parent ledgers see true subtree cost.
+        const nested = usageFromToolResultMessage(message);
+        if (hasBilledUsage(nested)) this.usage = addUsage(this.usage, nested);
       }
       return [{ type: "message", message, usage: { ...this.usage } }];
     }
