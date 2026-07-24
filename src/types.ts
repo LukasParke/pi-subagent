@@ -34,7 +34,11 @@ export interface UsageStats {
   turns: number;
 }
 
+export type BackendName = "pi" | "codex" | "claude";
+
 export interface TaskSpec {
+  /** Agent CLI powering this child. Defaults to "pi". */
+  backend?: BackendName;
   task: string;
   /** Short human label shown in UIs and result indexes. */
   label?: string;

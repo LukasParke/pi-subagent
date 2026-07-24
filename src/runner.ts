@@ -14,7 +14,9 @@ import {
   type SlotToken,
 } from "./process-lock.js";
 import { createGetPiCommand } from "./launch.js";
-import { checkAgainstSchema, extractStructuredResult, repairMessage, schemaContract } from "./structured.js";
+import { checkAgainstSchema, extractStructuredResult, repairMessage } from "./structured.js";
+import type { BackendAdapter, BackendParser } from "./backend.js";
+import { resolveBackend } from "./backends/index.js";
 
 export type GetPiCommand = (args: string[]) => { command: string; args: string[] };
 
@@ -45,6 +47,8 @@ export interface RunnerOptions {
   stallAfterMs?: number;
   /** Additional silence after the stall flag before the child is killed. 0 disables kill. */
   stallKillAfterMs?: number;
+  /** Backend adapter override (defaults to the spec's backend, then pi). */
+  backend?: BackendAdapter;
 }
 
 type StopReason = "cancelled" | "timeout" | "max_turns" | "max_cost" | "fatal" | "stalled";
@@ -65,6 +69,9 @@ export class ChildRunner {
   private readonly graceTurns: number;
   private readonly stallAfterMs: number;
   private readonly stallKillAfterMs: number;
+  private readonly backendOverride?: BackendAdapter;
+  /** Backend for the in-flight run; set at spawn so steer() uses the right dialect. */
+  private backend: BackendAdapter = resolveBackend("pi");
 
   constructor(
     private readonly semaphore = new Semaphore(defaultConfig.maxActiveProcesses, defaultConfig.maxQueuedTasks),
@@ -76,8 +83,9 @@ export class ChildRunner {
     private readonly runId?: string,
     private readonly parentSessionKey?: string,
     private readonly maxTaskBytes = DEFAULT_MAX_TASK_BYTES,
-    options: Pick<RunnerOptions, "graceTurns" | "stallAfterMs" | "stallKillAfterMs"> = {},
+    options: Pick<RunnerOptions, "graceTurns" | "stallAfterMs" | "stallKillAfterMs" | "backend"> = {},
   ) {
+    this.backendOverride = options.backend;
     this.graceTurns = options.graceTurns ?? defaultConfig.graceTurns;
     this.stallAfterMs = options.stallAfterMs ?? defaultConfig.stallAfterMs;
     this.stallKillAfterMs = options.stallKillAfterMs ?? defaultConfig.stallKillAfterMs;
@@ -89,7 +97,9 @@ export class ChildRunner {
    * child is not running or its stdin is closed.
    */
   steer(message: string): boolean {
-    return this.sendCommand?.({ type: "steer", message }) === true;
+    const command = this.backend.steerCommand?.(message);
+    if (command === undefined) return false;
+    return this.sendCommand?.(command) === true;
   }
 
   async run(spec: TaskSpec, abortSignal?: AbortSignal): Promise<TaskResult> {
@@ -122,13 +132,17 @@ export class ChildRunner {
     let slotHeld = false;
     let globalSlot: SlotToken | undefined;
     let forceKillTimer: NodeJS.Timeout | undefined;
-    let tempPromptDir: string | undefined;
+    const tempDirs: string[] = [];
     let requestedStop: StopReason | undefined;
     let fatalError: string | undefined;
     let timeoutPhase: TimeoutPhase | undefined;
     let abortHandler: (() => void) | undefined;
     let stderr = "";
-    const parser = new ProtocolParser();
+    // Backend resolution happens before anything else so parser dialect,
+    // capability checks and stdin command shapes all agree.
+    const backend = this.backendOverride ?? resolveBackend(spec.backend ?? "pi");
+    this.backend = backend;
+    const parser: BackendParser = backend.createParser();
     let spawned = false;
     let acquiredAt: number | undefined;
     let childStartTime = 0;
@@ -281,7 +295,7 @@ export class ChildRunner {
       processHandle?.stdout?.removeAllListeners();
       processHandle?.stderr?.removeAllListeners();
       processHandle?.removeAllListeners();
-      if (tempPromptDir) await fs.rm(tempPromptDir, { recursive: true, force: true }).catch(() => {});
+      for (const dir of tempDirs) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
       release();
     };
 
@@ -438,42 +452,12 @@ export class ChildRunner {
         );
       }
 
-      // RPC mode keeps a live stdin command channel so steering messages can be
-      // injected mid-run. The event stream on stdout is a superset of json mode.
-      const args = ["--mode", "rpc", "--session-dir", this.sessionDir];
-      if (spec.forkResume && spec.resume) args.push("--fork", spec.resume);
-      else if (spec.resume) args.push("--session", spec.resume);
-      else if (spec.contextFork) {
-        // Context fork: the child starts from a real branched copy of the
-        // parent conversation, then receives the task as its next prompt.
-        // Fail fast rather than silently degrading to a fresh session.
-        if (!spec.parentSessionFile) {
-          throw new Error("context:'fork' requires a persisted parent session (none available). Save the session or use context:'fresh'.");
-        }
-        await fs.access(spec.parentSessionFile).catch(() => {
-          throw new Error(`context:'fork' failed: parent session file ${spec.parentSessionFile} is not readable.`);
-        });
-        args.push("--fork", spec.parentSessionFile);
-      }
-      if (spec.model) args.push("--model", spec.model);
-      if (spec.thinking) args.push("--thinking", spec.thinking);
-      if (spec.tools !== undefined) {
-        const tools = spec.tools.filter((tool) => tool !== "subagent");
-        if (tools.length === 0) args.push("--no-tools");
-        else args.push("--tools", tools.join(","));
-      }
-      // Persona/system prompt first, structured-output contract last (highest salience).
-      const appendPrompt = [spec.systemPrompt?.trim(), spec.outputSchema ? schemaContract(spec.outputSchema) : undefined]
-        .filter(Boolean)
-        .join("\n\n");
-      if (appendPrompt) {
-        tempPromptDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-subagent-prompt-"));
-        const promptPath = path.join(tempPromptDir, "system-prompt.md");
-        await fs.writeFile(promptPath, appendPrompt, { encoding: "utf8", mode: 0o600 });
-        args.push("--append-system-prompt", promptPath);
-      }
+      const invocation = await backend.buildInvocation(spec, {
+        sessionDir: this.sessionDir,
+        getPiCommand: this.getPiCommand,
+      });
+      if (invocation.cleanupDirs?.length) tempDirs.push(...invocation.cleanupDirs);
 
-      const invocation = this.getPiCommand(args);
       const depth = Number.parseInt(process.env[DEPTH_ENV_VAR] ?? "0", 10) || 0;
       // Pin the launch identity + depth in env. Children re-register only when
       // depth leaves remaining headroom (enforced in extension + policy too).
