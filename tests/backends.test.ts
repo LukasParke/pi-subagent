@@ -1,4 +1,14 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, expect, it } from "vitest";
+import {
+  renderClaudeSessionLine,
+  renderCodexSessionLine,
+  resolveBackendSessionFilePath,
+  sessionLineRenderer,
+  tailSessionFile,
+} from "../src/transcript.js";
 import { CodexBackend, CodexParser } from "../src/backends/codex.js";
 import { ClaudeBackend, ClaudeParser } from "../src/backends/claude.js";
 import { PiBackend } from "../src/backends/pi.js";
@@ -94,7 +104,10 @@ describe("CodexBackend invocation", () => {
   });
 
   it("exposes no steer command, so steering is refused not ignored", () => {
-    expect(new CodexBackend().steerCommand).toBeUndefined();
+    const backend = new CodexBackend() as unknown as { steerCommand?: unknown };
+    expect(backend.steerCommand).toBeUndefined();
+    expect(new CodexBackend().capabilities.steer).toBe(false);
+    expect(new CodexBackend().capabilities.gracefulWrapUp).toBe(false);
   });
 });
 
@@ -205,5 +218,72 @@ describe("ClaudeParser against real captured output", () => {
     expect(result.errorMessage).toMatch(/tool limit exceeded/);
     // Paid work is still accounted even on failure.
     expect(result.usage.cost).toBeCloseTo(0.5, 6);
+  });
+});
+
+describe("resolveBackendSessionFilePath", () => {
+  it("finds a real codex rollout file by thread id", () => {
+    // Written by the live codex probe during development; skip if pruned.
+    const threadId = "019f9607-0327-7c32-aa03-f2affcdd58fb";
+    const resolved = resolveBackendSessionFilePath("codex", threadId);
+    if (!resolved) return; // codex history rotated away; nothing to assert
+    expect(resolved).toContain(threadId);
+    expect(resolved.endsWith(".jsonl")).toBe(true);
+    expect(fs.statSync(resolved).isFile()).toBe(true);
+  });
+
+  it("returns undefined for an unknown session id instead of a wrong file", () => {
+    expect(resolveBackendSessionFilePath("codex", "definitely-not-a-real-thread-id")).toBeUndefined();
+    expect(resolveBackendSessionFilePath("claude", "definitely-not-a-real-session")).toBeUndefined();
+  });
+
+  it("requires a sessionDir for the pi backend", () => {
+    expect(resolveBackendSessionFilePath("pi", "abc")).toBeUndefined();
+  });
+
+  it("resolves a claude project transcript from cwd slug", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-claude-home-"));
+    const cwd = "/private/tmp/example-project";
+    const projectDir = path.join(dir, ".claude", "projects", cwd.replace(/[/\\]/g, "-"));
+    fs.mkdirSync(projectDir, { recursive: true });
+    const file = path.join(projectDir, "sess-123.jsonl");
+    fs.writeFileSync(file, "{}\n");
+    expect(resolveBackendSessionFilePath("claude", "sess-123", { home: dir, cwd })).toBe(file);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("per-backend transcript renderers", () => {
+  it("renders codex rollout entries and skips the permissions preamble", () => {
+    const developer = '{"timestamp":"t","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<permissions instructions> sandbox_mode is read-only"}]}}';
+    const assistant = '{"timestamp":"t","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"README.md DONE"}]}}';
+    const shell = '{"timestamp":"t","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\\"cmd\\":\\"ls\\"}"}}';
+    expect(renderCodexSessionLine(developer)).toBeNull();
+    expect(renderCodexSessionLine(assistant)).toBe("assistant: README.md DONE");
+    expect(renderCodexSessionLine(shell)).toContain("tool exec_command");
+    expect(renderCodexSessionLine("not json")).toBeNull();
+  });
+
+  it("renders claude transcript entries and skips bookkeeping", () => {
+    const queue = '{"type":"queue-operation","operation":"enqueue","content":"hi"}';
+    const assistant = '{"type":"assistant","message":{"content":[{"type":"text","text":"CLAUDEPROBE"}]}}';
+    const toolUse = '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/tmp/x"}}]}}';
+    expect(renderClaudeSessionLine(queue)).toBeNull();
+    expect(renderClaudeSessionLine(assistant)).toBe("assistant: CLAUDEPROBE");
+    expect(renderClaudeSessionLine(toolUse)).toContain("tool Read");
+  });
+
+  it("selects the renderer by backend", () => {
+    expect(sessionLineRenderer("codex")).toBe(renderCodexSessionLine);
+    expect(sessionLineRenderer("claude")).toBe(renderClaudeSessionLine);
+    expect(sessionLineRenderer("pi")).not.toBe(renderCodexSessionLine);
+  });
+
+  it("tails a real codex rollout file into readable lines", () => {
+    const resolved = resolveBackendSessionFilePath("codex", "019f9607-369f-7f53-a7ee-de5d8de2c0f1");
+    if (!resolved) return; // history rotated
+    const tailed = tailSessionFile(resolved, undefined, undefined, sessionLineRenderer("codex"));
+    expect(tailed.status).toBe("ok");
+    expect(tailed.lines.join("\n")).toMatch(/assistant:/);
   });
 });

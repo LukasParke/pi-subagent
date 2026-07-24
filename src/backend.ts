@@ -112,9 +112,11 @@ export const BACKEND_NAMES: readonly BackendName[] = ["pi", "codex", "claude"];
  * profile would turn a safety feature into a no-op.
  */
 export function checkCapabilities(
-  spec: Pick<
-    TaskSpec,
-    "maxCost" | "resume" | "forkResume" | "contextFork" | "tools" | "thinking" | "outputSchema" | "profile" | "canWrite"
+  spec: Partial<
+    Pick<
+      TaskSpec,
+      "maxCost" | "resume" | "forkResume" | "contextFork" | "tools" | "thinking" | "outputSchema" | "profile" | "canWrite"
+    >
   >,
   capabilities: BackendCapabilities,
   backend: BackendName,

@@ -33,7 +33,7 @@ import { Semaphore } from "./semaphore.js";
 import type { RunSnapshot, TaskResult, TaskSpec, UsageStats } from "./types.js";
 import { emptyUsage } from "./types.js";
 import { addUsage, buildUsageLedger, formatLedger, hasBilledUsage, toPiUsage, type UsageLedger } from "./usage.js";
-import { resolveSessionFilePath } from "./transcript.js";
+import { resolveBackendSessionFilePath, resolveSessionFilePath } from "./transcript.js";
 import { CompletionBatcher, COMPLETION_MESSAGE_TYPE, type CompletionDetails, type CompletionDetailsRun } from "./notifications.js";
 import { describeCatalog, discoverAgents, type AgentDefinition } from "./agents.js";
 import { createSubagentsOverlay, FooterStatusModel, type SubagentAdapter } from "./ui.js";
@@ -182,8 +182,15 @@ function makeAdapter(runtime: SessionRuntime): SubagentAdapter {
     },
     getSessionFilePath(id) {
       const run = this.getRunById(id);
-      const sessionId = run?.results.find((result) => result.sessionId)?.sessionId;
+      const result = run?.results.find((entry) => entry.sessionId);
+      const sessionId = result?.sessionId;
       if (!sessionId) return undefined;
+      // Non-pi backends keep transcripts in their own vendor locations, so the
+      // live view resolves per backend instead of assuming pi's session dir.
+      const backend = result?.backend ?? "pi";
+      if (backend !== "pi") {
+        return resolveBackendSessionFilePath(backend, sessionId, { cwd: runtime.ctx.cwd });
+      }
       return resolveSessionFilePath(runtime.config.sessionDir, sessionId);
     },
   };

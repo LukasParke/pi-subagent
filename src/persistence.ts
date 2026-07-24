@@ -13,6 +13,7 @@ export interface PersistenceAdapter {
 }
 
 export interface PersistedResult {
+  backend?: import("./types.js").BackendName;
   label: string;
   task: string;
   state: RunState;

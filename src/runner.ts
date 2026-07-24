@@ -116,6 +116,7 @@ export class ChildRunner {
       outputMode: spec.outputMode,
       thinking: spec.thinking,
       profile: spec.profile,
+      backend: spec.backend ?? "pi",
       canWrite: spec.canWrite,
       startedAt,
       protocol: {
@@ -569,6 +570,7 @@ export class ChildRunner {
         outputMode: spec.outputMode,
         thinking: spec.thinking,
         profile: spec.profile,
+        backend: spec.backend ?? "pi",
         canWrite: spec.canWrite,
         process: result.process,
         startedAt,
