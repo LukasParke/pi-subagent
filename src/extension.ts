@@ -28,6 +28,7 @@ import type { ChildRunner } from "./runner.js";
 import { ProcessLockManager } from "./process-lock.js";
 import { SessionScopedRunRegistry, snapshotFromLiveRun } from "./registry.js";
 import { SubagentParamsSchema, SubagentWaitParamsSchema, type SubagentParams, type SubagentWaitParams } from "./schema.js";
+import { BTW_ENTRY_TYPE, btwLabel, type BtwEntry } from "./btw.js";
 import { Semaphore } from "./semaphore.js";
 import type { RunSnapshot, TaskResult, TaskSpec, UsageStats } from "./types.js";
 import { emptyUsage } from "./types.js";
@@ -1273,6 +1274,72 @@ export default function registerSubagent(pi: ExtensionAPI): void {
   } satisfies Parameters<typeof pi.registerTool>[0];
 
   pi.registerTool(subagentTool);
+
+  // `/btw` — user-originated side question. The run is a normal subagent run
+  // (full policy/budget/lock machinery) but its result is delivered to the
+  // TUI via appendEntry, which by design does NOT participate in LLM context.
+  // So the parent agent keeps working, unaware, while the user gets an answer.
+  // `/btw` results are custom entries: rendered for the human, invisible to the
+  // model. Keep it compact; expand shows the full answer.
+  pi.registerEntryRenderer(BTW_ENTRY_TYPE, (entry, { expanded }, theme) => {
+    const data = entry.data as BtwEntry | undefined;
+    if (!data) return undefined;
+    return lineComponentForMessage((width) => {
+      const glyph = data.state === "done" ? theme.fg("success", "✓")
+        : data.state === "failed" ? theme.fg("error", "✗")
+        : theme.fg("dim", "…");
+      const lines = [truncateToWidth(`${glyph} ${theme.bold(theme.fg("toolTitle", "by the way"))} ${theme.fg("dim", data.label)}`, width)];
+      const body = data.answer;
+      if (body) {
+        const rendered = expanded ? body.split("\n") : [body.split("\n").find((line) => line.trim()) ?? ""];
+        for (const line of rendered) lines.push(truncateToWidth(`  ${theme.fg("toolOutput", line)}`, width));
+        if (!expanded && body.split("\n").length > 1) {
+          lines.push(truncateToWidth(theme.fg("dim", "  (expand for full answer)"), width));
+        }
+      }
+      return lines;
+    });
+  });
+
+  pi.registerCommand("btw", {
+    description: "Ask a one-off side question in a subagent, hidden from the main agent's context",
+    handler: async (args, ctx) => {
+      const runtime = current;
+      if (!runtime || runtime.closed || runtime.key !== sessionKey(ctx)) {
+        return ctx.ui.notify("Subagent runtime is not ready", "error");
+      }
+      let question = (args ?? "").trim();
+      if (!question) {
+        question = (await ctx.ui.input("by the way", "Ask a one-off side question…"))?.trim() ?? "";
+        if (!question) return;
+      }
+
+      const label = btwLabel(question);
+      pi.appendEntry(BTW_ENTRY_TYPE, { state: "running", question, label } satisfies BtwEntry);
+      ctx.ui.notify(`by the way: ${label} — running in the background`, "info");
+
+      try {
+        // Reuse the tool's own execute so /btw inherits validation, profiles,
+        // budgets, semaphore + process locks, and output capping unchanged.
+        const result = await subagentTool.execute(
+          `btw-${Date.now()}`,
+          { task: question, profile: "explore", description: label } as SubagentParams,
+          undefined,
+          undefined,
+          ctx as never,
+        );
+        // The tool signals failure by throwing (fail()), so reaching here is success.
+        const text = result.content.find((item) => item.type === "text")?.text ?? "(no output)";
+        pi.appendEntry(BTW_ENTRY_TYPE, { state: "done", question, label, answer: String(text) } satisfies BtwEntry);
+        ctx.ui.notify(`by the way: ${label} — answered`, "info");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        pi.appendEntry(BTW_ENTRY_TYPE, { state: "failed", question, label, answer: message } satisfies BtwEntry);
+        ctx.ui.notify(`by the way failed: ${message}`, "error");
+      }
+    },
+  });
+
 
   // Dedicated blocking-collect tool. Thin front-end: it rewrites its args into
   // the equivalent `action:"wait"` request and reuses the main tool's execute,
