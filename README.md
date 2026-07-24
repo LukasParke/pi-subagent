@@ -75,6 +75,13 @@ Publishing is automated from `v*` tags — see [docs/RELEASING.md](./docs/RELEAS
 { action: "wait", id: "abc123" }      // interruptible; does not cancel
 { action: "cancel", id: "abc123" }
 
+// Collecting a background run also has its own tool, for reflexive mid-flow
+// use. Identical semantics to action:"wait" (same handler underneath).
+// A timeout returns a still-running notice WITHOUT cancelling or consuming
+// the run, so it stays collectable.
+subagent_wait { id: "abc123" }
+subagent_wait { id: "abc123", timeout_ms: 30000 }
+
 // Dry-run a spawn request: full validation + preflights (git repo, fork
 // session, output paths), returns the resolved per-task plan (model, tools,
 // budgets, isolation) without spawning anything.
@@ -132,6 +139,20 @@ Publishing is automated from `v*` tags — see [docs/RELEASING.md](./docs/RELEAS
 
 The `/subagents` overlay mirrors the worktree loop interactively: `s` steer,
 `a` apply, `x` discard on the selected run.
+
+## Side questions (`/btw`)
+
+```
+/btw does this repo have a rate limiter?
+/btw                      # prompts for the question
+```
+
+`/btw` runs a one-off read-only subagent for *you*, not for the model. It uses
+the same policy, budget, semaphore and process-lock machinery as any run, but
+delivers its answer as a custom session entry, which does not participate in
+LLM context. The main agent keeps working and never sees the question or the
+answer — useful for checking something mid-task without derailing the
+conversation or polluting the context window.
 
 ## Profiles
 
@@ -335,7 +356,8 @@ needs durability must construct and share one.
 ```
 src/
   extension.ts     # Pi wiring only
-  schema.ts        # request schema
+  schema.ts        # request schemas (subagent + subagent_wait)
+  btw.ts           # /btw side questions (model-hidden entries)
   policy.ts        # profiles, normalization, write guards, agent resolution
   agents.ts        # named agent files (.pi/agents/, .agents/agents/, global)
   launch.ts        # resolve child pi via execPath / PI_SUBAGENT_BIN

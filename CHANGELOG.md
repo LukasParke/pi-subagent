@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.5.1
+
+### `subagent_wait` — dedicated blocking-collect tool
+
+- New **`subagent_wait`** tool (`{ id, timeout_ms? }`) sits alongside `subagent`.
+  Collecting a background run is the one management step a model reaches for
+  reflexively mid-flow, and burying it behind the `action:` union cost a
+  discovery step. This matches the shape the highest-adoption package in the
+  ecosystem converged on (`pi-subagents` ships `subagent` + `subagent_wait`).
+- Implemented as a thin front-end that rewrites its arguments into the
+  equivalent `action:"wait"` request and reuses the main tool's `execute`, so
+  delivery / `markDelivered` / output-cap semantics cannot drift between the
+  two surfaces. `action:"wait"` remains fully supported.
+- **`timeout_ms`** added to the shared wait path (so `action:"wait"` gains it
+  too): on timeout the run is explicitly **not** cancelled and **not** marked
+  delivered, so it stays collectable by a later wait.
+
+### `/btw` — side questions hidden from the main agent
+
+- New **`/btw <question>`** command (or bare `/btw` for a prompt). The aside
+  runs as a normal subagent run — full policy, profile, budget, semaphore and
+  process-lock machinery — but its result is delivered with `pi.appendEntry()`
+  + an entry renderer, which by design does not participate in LLM context.
+  The user gets an answer rendered in the transcript while the main agent keeps
+  working, unaware of both question and answer.
+- Ported from [davis7dotsh/my-pi-setup](https://github.com/davis7dotsh/my-pi-setup)'s
+  by-the-way feature, adapted to our process-per-child model.
+
+Tests: 273 → 276. Both features' load-bearing invariants are mutation-checked.
+
 ## 0.5.0
 
 ### Native Pi cost accounting (pi#6671)
