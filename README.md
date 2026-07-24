@@ -154,6 +154,38 @@ LLM context. The main agent keeps working and never sees the question or the
 answer — useful for checking something mid-task without derailing the
 conversation or polluting the context window.
 
+## Backends
+
+Children can run on a different agent CLI. Everything else — worktrees, process
+locks, depth limits, budgets, orphan reclaim — is backend-agnostic and applies
+unchanged.
+
+```ts
+{ task: "Summarize this module", backend: "codex", profile: "explore" }
+{ task: "Review this diff",      backend: "claude", max_cost: 0.50 }
+```
+
+Requires the corresponding CLI on PATH (`codex`, `claude`). Capabilities differ,
+and **unsupported combinations are refused with an explanation rather than
+silently ignored** — a dropped `max_cost` or unenforced read-only profile would
+be a safety regression, not a minor degradation.
+
+| | `pi` (default) | `codex` | `claude` |
+|---|---|---|---|
+| `max_cost` | yes | **refused** (reports tokens, no cost) | yes (`total_cost_usd`) |
+| read-only profile | tool allowlist | `--sandbox read-only` (OS-level) | `--allowedTools` |
+| steering / graceful wrap-up | yes | **no** (no stdin channel) | **no** (one-shot) |
+| `resume` | yes | yes | yes |
+| `context:'fork'`, `fork_resume` | yes | **refused** | yes |
+| `thinking` | yes | no | no |
+| `output_schema` | yes | yes | yes |
+
+A budget breach on a backend without steering hard-stops instead of asking the
+child to wrap up. Codex's read-only sandbox is enforced by the OS, which is
+stronger than a tool allowlist.
+
+Set a persona's backend in agent frontmatter with `backend: codex`.
+
 ## Profiles
 
 | Profile | Tools | Writes |
@@ -358,6 +390,8 @@ src/
   extension.ts     # Pi wiring only
   schema.ts        # request schemas (subagent + subagent_wait)
   btw.ts           # /btw side questions (model-hidden entries)
+  backend.ts       # backend adapter seam + capability gate
+  backends/        # pi | codex | claude adapters (invocation + parser)
   policy.ts        # profiles, normalization, write guards, agent resolution
   agents.ts        # named agent files (.pi/agents/, .agents/agents/, global)
   launch.ts        # resolve child pi via execPath / PI_SUBAGENT_BIN
