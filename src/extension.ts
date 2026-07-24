@@ -27,7 +27,7 @@ import { parseDepth, parseSpawnPolicy, SPAWNS_ENV_VAR, validateSubagentRequest, 
 import type { ChildRunner } from "./runner.js";
 import { ProcessLockManager } from "./process-lock.js";
 import { SessionScopedRunRegistry, snapshotFromLiveRun } from "./registry.js";
-import { SubagentParamsSchema, type SubagentParams } from "./schema.js";
+import { SubagentParamsSchema, SubagentWaitParamsSchema, type SubagentParams, type SubagentWaitParams } from "./schema.js";
 import { Semaphore } from "./semaphore.js";
 import type { RunSnapshot, TaskResult, TaskSpec, UsageStats } from "./types.js";
 import { emptyUsage } from "./types.js";
@@ -823,7 +823,7 @@ export default function registerSubagent(pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerTool({
+  const subagentTool = {
     name: "subagent",
     label: "Subagent",
     description: "Run isolated Pi subagents in foreground, parallel, or cancellable background mode.",
@@ -834,6 +834,16 @@ export default function registerSubagent(pi: ExtensionAPI): void {
     promptGuidelines: guidelines(discoverAgents(process.cwd())),
     parameters: SubagentParamsSchema,
     async execute(_id, params: SubagentParams, signal, onUpdate, ctx) {
+      // `subagent_wait` delegates here with a synthesized action:"wait" params
+      // object, carrying its timeout through this non-schema field so the two
+      // tools share exactly one collect/deliver path.
+      let waitTimeoutMs: number | undefined;
+      if ("__waitTimeoutMs" in (params as object)) {
+        const smuggled = params as SubagentParams & { __waitTimeoutMs?: number };
+        waitTimeoutMs = smuggled.__waitTimeoutMs;
+        // Strip before validation: the schema is additionalProperties:false.
+        delete smuggled.__waitTimeoutMs;
+      }
       const runtime = current;
       if (!runtime || runtime.closed || runtime.key !== sessionKey(ctx)) {
         fail("Subagent runtime is not initialized for this session.");
@@ -957,10 +967,33 @@ export default function registerSubagent(pi: ExtensionAPI): void {
           // Wait must stay interruptible: aborting the wait returns promptly
           // WITHOUT cancelling the background run (that is cancel's job).
           const settled = found.run.promise.then(() => "done" as const, () => "done" as const);
-          const raced = await Promise.race([settled, abortAsPromise(signal) ?? settled]);
+          const races: Array<Promise<"done" | "aborted" | "timeout">> = [settled];
+          const abortRace = abortAsPromise(signal);
+          if (abortRace) races.push(abortRace as Promise<"aborted">);
+          let timer: NodeJS.Timeout | undefined;
+          if (waitTimeoutMs !== undefined) {
+            races.push(new Promise<"timeout">((resolve) => {
+              timer = setTimeout(() => resolve("timeout"), waitTimeoutMs);
+              timer.unref?.();
+            }));
+          }
+          let raced: "done" | "aborted" | "timeout";
+          try {
+            raced = await Promise.race(races);
+          } finally {
+            if (timer) clearTimeout(timer);
+          }
           if (raced === "aborted") {
             return {
               content: [{ type: "text", text: `Wait aborted. Run ${snapshot.id} continues in the background; use status/wait/cancel later or open /subagents.` }],
+              details: details(snapshot.mode, snapshot.results, snapshot),
+            };
+          }
+          if (raced === "timeout") {
+            // Timing out must not consume the result: the run keeps going and
+            // stays collectable, so we deliberately skip markDelivered here.
+            return {
+              content: [{ type: "text", text: `Wait timed out after ${waitTimeoutMs}ms. Run ${snapshot.id} is still running and was NOT cancelled; collect it with subagent_wait again (or action:'status'), or stop it with action:'cancel'.` }],
               details: details(snapshot.mode, snapshot.results, snapshot),
             };
           }
@@ -1237,5 +1270,33 @@ export default function registerSubagent(pi: ExtensionAPI): void {
       });
       return block;
     },
+  } satisfies Parameters<typeof pi.registerTool>[0];
+
+  pi.registerTool(subagentTool);
+
+  // Dedicated blocking-collect tool. Thin front-end: it rewrites its args into
+  // the equivalent `action:"wait"` request and reuses the main tool's execute,
+  // so delivery/markDelivered/cap semantics cannot drift between the two.
+  pi.registerTool({
+    name: "subagent_wait",
+    label: "Subagent wait",
+    description:
+      "Block until a background subagent run (async:true) settles, then deliver its output. Equivalent to subagent { action: 'wait', id }. Aborting or timing out leaves the run alive and collectable; use subagent { action: 'cancel' } to stop it.",
+    parameters: SubagentWaitParamsSchema,
+    async execute(id, params: SubagentWaitParams, signal, onUpdate, ctx) {
+      return subagentTool.execute(
+        id,
+        {
+          action: "wait",
+          id: params.id,
+          ...(params.timeout_ms !== undefined ? { __waitTimeoutMs: params.timeout_ms } : {}),
+        } as SubagentParams,
+        signal,
+        onUpdate as never,
+        ctx,
+      );
+    },
+    renderCall: subagentTool.renderCall as never,
+    renderResult: subagentTool.renderResult as never,
   });
 }

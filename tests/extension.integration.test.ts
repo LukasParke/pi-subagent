@@ -7,6 +7,7 @@ import { RUN_ENTRY_TYPE } from "../src/persistence.js";
 
 interface Harness {
   tool: any;
+  waitTool: any;
   handlers: Map<string, Function>;
   entries: any[];
   ctx: any;
@@ -28,6 +29,7 @@ function harness(): Harness {
   const handlers = new Map<string, Function>();
   const entries: any[] = [rootAssistant(0.2)];
   let tool: any;
+  let waitTool: any;
   const ui = {
     theme: { fg: (_c: string, text: string) => text, bold: (text: string) => text },
     setStatus: vi.fn(), notify: vi.fn(), setEditorText: vi.fn(),
@@ -44,7 +46,12 @@ function harness(): Harness {
   const sentMessages: any[] = [];
   const pi = {
     on: (name: string, fn: Function) => handlers.set(name, fn),
-    registerTool: (definition: any) => { tool = definition; },
+    // Two tools register (`subagent` + `subagent_wait`); keep the main one as
+    // `tool` and expose the wait front-end separately.
+    registerTool: (definition: any) => {
+      if (definition.name === "subagent_wait") waitTool = definition;
+      else tool = definition;
+    },
     registerCommand: vi.fn(),
     registerMessageRenderer: vi.fn(),
     sendMessage: (message: any, options?: any) => { sentMessages.push({ message, options }); },
@@ -56,7 +63,7 @@ function harness(): Harness {
     getThinkingLevel: () => "off",
   };
   register(pi as any);
-  return { get tool() { return tool; }, handlers, entries, ctx, pi, sentMessages } as unknown as Harness;
+  return { get tool() { return tool; }, get waitTool() { return waitTool; }, handlers, entries, ctx, pi, sentMessages } as unknown as Harness;
 }
 
 async function execute(h: Harness, params: any, signal?: AbortSignal, update = vi.fn()) {
@@ -575,6 +582,42 @@ describe("extension end-to-end wiring", () => {
     const specific = await execute(h, { action: "status", id });
     expect(specific.content[0].text).toContain("session test-session-123");
     expect(specific.content[0].text).not.toMatch(/\(resumable\)/);
+    await h.handlers.get("session_shutdown")!();
+  });
+
+  it("subagent_wait delivers a background run like action:wait", async () => {
+    const h = harness();
+    await h.handlers.get("session_start")!({}, h.ctx);
+    expect(h.waitTool.name).toBe("subagent_wait");
+
+    const started = await execute(h, { task: "bg", profile: "explore", async: true });
+    const id = runId(started.content[0].text);
+
+    const delivered = await h.waitTool.execute("call", { id }, undefined, vi.fn(), h.ctx);
+    expect(delivered.isError).not.toBe(true);
+    expect(delivered.content[0].text).toBe("Hello world!");
+
+    // Delivery is consumed exactly once, shared with action:wait.
+    const again = await execute(h, { action: "wait", id });
+    expect(again.content[0].text).toMatch(/already delivered/);
+    await h.handlers.get("session_shutdown")!();
+  });
+
+  it("subagent_wait timeout leaves the run alive and collectable", async () => {
+    const h = harness();
+    await h.handlers.get("session_start")!({}, h.ctx);
+    process.env.FAKE_PI_DELAY_MS = "300";
+    const started = await execute(h, { task: "slow", profile: "explore", async: true });
+    const id = runId(started.content[0].text);
+
+    const timedOut = await h.waitTool.execute("call", { id, timeout_ms: 20 }, undefined, vi.fn(), h.ctx);
+    expect(timedOut.isError).not.toBe(true);
+    expect(timedOut.content[0].text).toMatch(/timed out after 20ms/);
+    expect(timedOut.content[0].text).toMatch(/NOT cancelled/);
+
+    // Timing out must not consume the result: it still delivers afterwards.
+    const delivered = await h.waitTool.execute("call", { id }, undefined, vi.fn(), h.ctx);
+    expect(delivered.content[0].text).toBe("Hello world!");
     await h.handlers.get("session_shutdown")!();
   });
 
