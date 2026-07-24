@@ -27,6 +27,8 @@ const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as 
 const PROFILES = ["explore", "review", "general"] as const;
 
 export interface AgentDefinition {
+  /** Agent CLI backend this persona runs on (pi | codex | claude). */
+  backend?: "pi" | "codex" | "claude";
   /** Agent name (the file name without extension). */
   name: string;
   /** One-line routing description shown to the orchestrating model. */
@@ -186,6 +188,10 @@ export function parseAgentFile(name: string, raw: string, source: string, scope:
     : frontmatter.isolation === "shared" ? "shared" as const
     : undefined;
   const spawns = frontmatter.spawns !== undefined ? parseSpawns(frontmatter.spawns) : undefined;
+  const backend = frontmatter.backend === "codex" ? "codex" as const
+    : frontmatter.backend === "claude" ? "claude" as const
+    : frontmatter.backend === "pi" ? "pi" as const
+    : undefined;
 
   const expanded = expandIncludes(body, source);
   const systemPrompt = expanded.trim() || undefined;
@@ -206,6 +212,7 @@ export function parseAgentFile(name: string, raw: string, source: string, scope:
     fallbackModels: frontmatter.fallback_models ? parseList(frontmatter.fallback_models) : undefined,
     maxRetries: frontmatter.max_retries ? parseNumber(frontmatter.max_retries) : undefined,
     isolation,
+    backend,
     outputSchema: frontmatter.output_schema ? parseSchemaValue(frontmatter.output_schema, source) : undefined,
     spawns,
   };

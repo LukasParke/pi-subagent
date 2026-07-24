@@ -5,6 +5,8 @@ import { isPlausibleSchema, repairDoubleEncodedText } from "./structured.js";
 import { defaultConfig, type TaskDefaults, type TaskDefaultsByProfile } from "./config.js";
 import type { OutputMode, TaskProfile, TaskSpec } from "./types.js";
 import type { ParallelTaskInput, SubagentParams } from "./schema.js";
+import { BACKEND_NAMES, checkCapabilities, type BackendName } from "./backend.js";
+import { resolveBackend } from "./backends/index.js";
 
 export const DEPTH_ENV_VAR = "PI_SUBAGENT_DEPTH";
 export const SPAWNS_ENV_VAR = "PI_SUBAGENT_SPAWNS";
@@ -123,6 +125,7 @@ function normalizeTask(
     allow_shared_writes?: boolean;
     keep_background?: boolean;
     include_wip?: boolean;
+    backend?: BackendName;
   },
   index: number,
   parent: ParentContext,
@@ -187,8 +190,39 @@ function normalizeTask(
       ? agent.name
       : `task-${index + 1}`;
   const systemPrompt = [agent?.systemPrompt, item.system_prompt].filter(Boolean).join("\n\n") || undefined;
+
+  // Backend capability gate. Refuse combinations the backend cannot honor
+  // rather than silently dropping a budget or a read-only guarantee.
+  const backend: BackendName = item.backend ?? agent?.backend ?? "pi";
+  if (!BACKEND_NAMES.includes(backend)) {
+    return { error: `Task ${index + 1}: unknown backend '${backend}' (expected ${BACKEND_NAMES.join(", ")})` };
+  }
+  const capabilities = resolveBackend(backend).capabilities;
+  const problems = checkCapabilities(
+    {
+      maxCost: item.max_cost ?? agent?.maxCost ?? profileDefaults.maxCost,
+      resume: item.resume,
+      forkResume: item.fork_resume,
+      contextFork: item.context === "fork",
+      // Only report a tool-restriction problem when the profile actually
+      // restricts: profile 'general' inherits the parent set and does not
+      // promise a read-only sandbox.
+      tools: profile === "general" ? undefined : resolved.tools,
+      thinking: item.thinking ?? agent?.thinking,
+      outputSchema: item.output_schema ?? agent?.outputSchema,
+      profile,
+      canWrite: resolved.canWrite,
+    },
+    capabilities,
+    backend,
+  );
+  if (problems.length) {
+    return { error: `Task ${index + 1}: ${problems.join("; ")}` };
+  }
+
   return {
     task: {
+      backend,
       label,
       task: repairDoubleEncodedText(item.task.trim()),
       systemPrompt: systemPrompt ? repairDoubleEncodedText(systemPrompt) : systemPrompt,
@@ -222,6 +256,7 @@ function normalizeTask(
       canWrite: resolved.canWrite,
       effectiveTools: resolved.tools,
       resolutionNotes: [
+        `backend=${backend}`,
         `profile=${profile}`,
         `access=${resolved.canWrite ? "RW" : "RO"}`,
         ...(agent ? [`agent=${agent.name}`] : []),

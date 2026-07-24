@@ -453,3 +453,59 @@ describe("policy", () => {
     });
   });
 });
+
+describe("backend capability gate", () => {
+  const parent = {
+    cwd: process.cwd(),
+    model: "fake/model",
+    thinking: "off" as const,
+    availableTools: ["read", "grep", "find", "ls", "bash", "edit", "write"],
+    activeTools: ["read", "grep", "find", "ls", "bash", "edit", "write"],
+    depth: 0,
+    sessionFile: "/tmp/parent.jsonl",
+  };
+
+  it("defaults to the pi backend", () => {
+    const result = validateSubagentRequest({ task: "x" }, parent);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.tasks[0]!.backend).toBe("pi");
+  });
+
+  it("accepts an explicit codex backend", () => {
+    const result = validateSubagentRequest({ task: "x", backend: "codex" }, parent);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.tasks[0]!.backend).toBe("codex");
+  });
+
+  it("refuses max_cost on codex, which reports no cost", () => {
+    const result = validateSubagentRequest({ task: "x", backend: "codex", max_cost: 1 }, parent);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toMatch(/does not report per-turn cost/);
+      expect(result.error).toMatch(/max_cost cannot be enforced/);
+    }
+  });
+
+  it("allows max_cost on claude, which does report cost", () => {
+    const result = validateSubagentRequest({ task: "x", backend: "claude", max_cost: 1 }, parent);
+    expect(result.ok).toBe(true);
+  });
+
+  it("refuses context:fork on codex, which cannot fork sessions", () => {
+    const result = validateSubagentRequest({ task: "x", backend: "codex", context: "fork" }, parent);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/cannot fork sessions/);
+  });
+
+  it("rejects an unknown backend by name", () => {
+    const result = validateSubagentRequest({ task: "x", backend: "gpt5" as never }, parent);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/unknown backend/);
+  });
+
+  it("records the backend in resolution notes", () => {
+    const result = validateSubagentRequest({ task: "x", backend: "codex" }, parent);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.tasks[0]!.resolutionNotes).toContain("backend=codex");
+  });
+});
