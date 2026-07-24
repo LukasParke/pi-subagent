@@ -647,6 +647,18 @@ describe("extension end-to-end wiring", () => {
     await h.handlers.get("session_shutdown")!();
   });
 
+  it("/btw without a question requires dialog-capable UI", async () => {
+    const h = harness();
+    await h.handlers.get("session_start")!({}, h.ctx);
+    const btw = h.commands.get("btw");
+
+    // harness ctx has hasUI: false (print-mode equivalent)
+    await btw.handler("", h.ctx);
+    expect(h.ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("/btw needs a question"), "error");
+    expect(h.entries.some((entry) => entry.customType === "subagent-btw")).toBe(false);
+    await h.handlers.get("session_shutdown")!();
+  });
+
   it("action:plan dry-runs validation without spawning a run", async () => {
     const h = harness();
     await h.handlers.get("session_start")!({}, h.ctx);

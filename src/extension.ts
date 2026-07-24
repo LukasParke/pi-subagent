@@ -1310,6 +1310,12 @@ export default function registerSubagent(pi: ExtensionAPI): void {
       }
       let question = (args ?? "").trim();
       if (!question) {
+        // The interactive prompt needs dialog-capable UI (TUI/RPC). In print
+        // mode there is nothing to prompt with, so require an inline question
+        // rather than silently doing nothing.
+        if (!ctx.hasUI) {
+          return ctx.ui.notify("/btw needs a question: /btw <your question>", "error");
+        }
         question = (await ctx.ui.input("by the way", "Ask a one-off side question…"))?.trim() ?? "";
         if (!question) return;
       }
