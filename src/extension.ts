@@ -27,12 +27,13 @@ import { parseDepth, parseSpawnPolicy, SPAWNS_ENV_VAR, validateSubagentRequest, 
 import type { ChildRunner } from "./runner.js";
 import { ProcessLockManager } from "./process-lock.js";
 import { SessionScopedRunRegistry, snapshotFromLiveRun } from "./registry.js";
-import { SubagentParamsSchema, type SubagentParams } from "./schema.js";
+import { SubagentParamsSchema, SubagentWaitParamsSchema, type SubagentParams, type SubagentWaitParams } from "./schema.js";
+import { BTW_ENTRY_TYPE, btwLabel, type BtwEntry } from "./btw.js";
 import { Semaphore } from "./semaphore.js";
 import type { RunSnapshot, TaskResult, TaskSpec, UsageStats } from "./types.js";
 import { emptyUsage } from "./types.js";
 import { addUsage, buildUsageLedger, formatLedger, hasBilledUsage, toPiUsage, type UsageLedger } from "./usage.js";
-import { resolveSessionFilePath } from "./transcript.js";
+import { resolveBackendSessionFilePath, resolveSessionFilePath } from "./transcript.js";
 import { CompletionBatcher, COMPLETION_MESSAGE_TYPE, type CompletionDetails, type CompletionDetailsRun } from "./notifications.js";
 import { describeCatalog, discoverAgents, type AgentDefinition } from "./agents.js";
 import { createSubagentsOverlay, FooterStatusModel, type SubagentAdapter } from "./ui.js";
@@ -181,8 +182,15 @@ function makeAdapter(runtime: SessionRuntime): SubagentAdapter {
     },
     getSessionFilePath(id) {
       const run = this.getRunById(id);
-      const sessionId = run?.results.find((result) => result.sessionId)?.sessionId;
+      const result = run?.results.find((entry) => entry.sessionId);
+      const sessionId = result?.sessionId;
       if (!sessionId) return undefined;
+      // Non-pi backends keep transcripts in their own vendor locations, so the
+      // live view resolves per backend instead of assuming pi's session dir.
+      const backend = result?.backend ?? "pi";
+      if (backend !== "pi") {
+        return resolveBackendSessionFilePath(backend, sessionId, { cwd: runtime.ctx.cwd });
+      }
       return resolveSessionFilePath(runtime.config.sessionDir, sessionId);
     },
   };
@@ -823,7 +831,7 @@ export default function registerSubagent(pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerTool({
+  const subagentTool = {
     name: "subagent",
     label: "Subagent",
     description: "Run isolated Pi subagents in foreground, parallel, or cancellable background mode.",
@@ -834,6 +842,16 @@ export default function registerSubagent(pi: ExtensionAPI): void {
     promptGuidelines: guidelines(discoverAgents(process.cwd())),
     parameters: SubagentParamsSchema,
     async execute(_id, params: SubagentParams, signal, onUpdate, ctx) {
+      // `subagent_wait` delegates here with a synthesized action:"wait" params
+      // object, carrying its timeout through this non-schema field so the two
+      // tools share exactly one collect/deliver path.
+      let waitTimeoutMs: number | undefined;
+      if ("__waitTimeoutMs" in (params as object)) {
+        const smuggled = params as SubagentParams & { __waitTimeoutMs?: number };
+        waitTimeoutMs = smuggled.__waitTimeoutMs;
+        // Strip before validation: the schema is additionalProperties:false.
+        delete smuggled.__waitTimeoutMs;
+      }
       const runtime = current;
       if (!runtime || runtime.closed || runtime.key !== sessionKey(ctx)) {
         fail("Subagent runtime is not initialized for this session.");
@@ -957,10 +975,33 @@ export default function registerSubagent(pi: ExtensionAPI): void {
           // Wait must stay interruptible: aborting the wait returns promptly
           // WITHOUT cancelling the background run (that is cancel's job).
           const settled = found.run.promise.then(() => "done" as const, () => "done" as const);
-          const raced = await Promise.race([settled, abortAsPromise(signal) ?? settled]);
+          const races: Array<Promise<"done" | "aborted" | "timeout">> = [settled];
+          const abortRace = abortAsPromise(signal);
+          if (abortRace) races.push(abortRace as Promise<"aborted">);
+          let timer: NodeJS.Timeout | undefined;
+          if (waitTimeoutMs !== undefined) {
+            races.push(new Promise<"timeout">((resolve) => {
+              timer = setTimeout(() => resolve("timeout"), waitTimeoutMs);
+              timer.unref?.();
+            }));
+          }
+          let raced: "done" | "aborted" | "timeout";
+          try {
+            raced = await Promise.race(races);
+          } finally {
+            if (timer) clearTimeout(timer);
+          }
           if (raced === "aborted") {
             return {
               content: [{ type: "text", text: `Wait aborted. Run ${snapshot.id} continues in the background; use status/wait/cancel later or open /subagents.` }],
+              details: details(snapshot.mode, snapshot.results, snapshot),
+            };
+          }
+          if (raced === "timeout") {
+            // Timing out must not consume the result: the run keeps going and
+            // stays collectable, so we deliberately skip markDelivered here.
+            return {
+              content: [{ type: "text", text: `Wait timed out after ${waitTimeoutMs}ms. Run ${snapshot.id} is still running and was NOT cancelled; collect it with subagent_wait again (or action:'status'), or stop it with action:'cancel'.` }],
               details: details(snapshot.mode, snapshot.results, snapshot),
             };
           }
@@ -1237,5 +1278,105 @@ export default function registerSubagent(pi: ExtensionAPI): void {
       });
       return block;
     },
+  } satisfies Parameters<typeof pi.registerTool>[0];
+
+  pi.registerTool(subagentTool);
+
+  // `/btw` — user-originated side question. The run is a normal subagent run
+  // (full policy/budget/lock machinery) but its result is delivered to the
+  // TUI via appendEntry, which by design does NOT participate in LLM context.
+  // So the parent agent keeps working, unaware, while the user gets an answer.
+  // `/btw` results are custom entries: rendered for the human, invisible to the
+  // model. Keep it compact; expand shows the full answer.
+  pi.registerEntryRenderer(BTW_ENTRY_TYPE, (entry, { expanded }, theme) => {
+    const data = entry.data as BtwEntry | undefined;
+    if (!data) return undefined;
+    return lineComponentForMessage((width) => {
+      const glyph = data.state === "done" ? theme.fg("success", "✓")
+        : data.state === "failed" ? theme.fg("error", "✗")
+        : theme.fg("dim", "…");
+      const lines = [truncateToWidth(`${glyph} ${theme.bold(theme.fg("toolTitle", "by the way"))} ${theme.fg("dim", data.label)}`, width)];
+      const body = data.answer;
+      if (body) {
+        const rendered = expanded ? body.split("\n") : [body.split("\n").find((line) => line.trim()) ?? ""];
+        for (const line of rendered) lines.push(truncateToWidth(`  ${theme.fg("toolOutput", line)}`, width));
+        if (!expanded && body.split("\n").length > 1) {
+          lines.push(truncateToWidth(theme.fg("dim", "  (expand for full answer)"), width));
+        }
+      }
+      return lines;
+    });
+  });
+
+  pi.registerCommand("btw", {
+    description: "Ask a one-off side question in a subagent, hidden from the main agent's context",
+    handler: async (args, ctx) => {
+      const runtime = current;
+      if (!runtime || runtime.closed || runtime.key !== sessionKey(ctx)) {
+        return ctx.ui.notify("Subagent runtime is not ready", "error");
+      }
+      let question = (args ?? "").trim();
+      if (!question) {
+        // The interactive prompt needs dialog-capable UI (TUI/RPC). In print
+        // mode there is nothing to prompt with, so require an inline question
+        // rather than silently doing nothing.
+        if (!ctx.hasUI) {
+          return ctx.ui.notify("/btw needs a question: /btw <your question>", "error");
+        }
+        question = (await ctx.ui.input("by the way", "Ask a one-off side question…"))?.trim() ?? "";
+        if (!question) return;
+      }
+
+      const label = btwLabel(question);
+      pi.appendEntry(BTW_ENTRY_TYPE, { state: "running", question, label } satisfies BtwEntry);
+      ctx.ui.notify(`by the way: ${label} — running in the background`, "info");
+
+      try {
+        // Reuse the tool's own execute so /btw inherits validation, profiles,
+        // budgets, semaphore + process locks, and output capping unchanged.
+        const result = await subagentTool.execute(
+          `btw-${Date.now()}`,
+          { task: question, profile: "explore", description: label } as SubagentParams,
+          undefined,
+          undefined,
+          ctx as never,
+        );
+        // The tool signals failure by throwing (fail()), so reaching here is success.
+        const text = result.content.find((item) => item.type === "text")?.text ?? "(no output)";
+        pi.appendEntry(BTW_ENTRY_TYPE, { state: "done", question, label, answer: String(text) } satisfies BtwEntry);
+        ctx.ui.notify(`by the way: ${label} — answered`, "info");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        pi.appendEntry(BTW_ENTRY_TYPE, { state: "failed", question, label, answer: message } satisfies BtwEntry);
+        ctx.ui.notify(`by the way failed: ${message}`, "error");
+      }
+    },
+  });
+
+
+  // Dedicated blocking-collect tool. Thin front-end: it rewrites its args into
+  // the equivalent `action:"wait"` request and reuses the main tool's execute,
+  // so delivery/markDelivered/cap semantics cannot drift between the two.
+  pi.registerTool({
+    name: "subagent_wait",
+    label: "Subagent wait",
+    description:
+      "Block until a background subagent run (async:true) settles, then deliver its output. Equivalent to subagent { action: 'wait', id }. Aborting or timing out leaves the run alive and collectable; use subagent { action: 'cancel' } to stop it.",
+    parameters: SubagentWaitParamsSchema,
+    async execute(id, params: SubagentWaitParams, signal, onUpdate, ctx) {
+      return subagentTool.execute(
+        id,
+        {
+          action: "wait",
+          id: params.id,
+          ...(params.timeout_ms !== undefined ? { __waitTimeoutMs: params.timeout_ms } : {}),
+        } as SubagentParams,
+        signal,
+        onUpdate as never,
+        ctx,
+      );
+    },
+    renderCall: subagentTool.renderCall as never,
+    renderResult: subagentTool.renderResult as never,
   });
 }

@@ -13,7 +13,7 @@ import {
   SPINNERS,
   stateGlyph,
 } from "./format.js";
-import { tailSessionFile, type TailSessionStatus } from "./transcript.js";
+import { sessionLineRenderer, tailSessionFile, type TailSessionStatus } from "./transcript.js";
 
 export interface SubagentAdapter {
   getActiveRuns(): RunSnapshot[];
@@ -195,7 +195,9 @@ export class SubagentsOverlay implements Component {
       this.transcriptLines = [];
       return;
     }
-    const result = tailSessionFile(path);
+    // Each backend writes its own transcript dialect; pick the matching renderer.
+    const backend = run.results.find((entry) => entry.sessionId)?.backend ?? "pi";
+    const result = tailSessionFile(path, undefined, undefined, sessionLineRenderer(backend));
     this.transcriptStatus = result.status;
     this.transcriptLines = result.lines;
   }

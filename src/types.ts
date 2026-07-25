@@ -34,7 +34,11 @@ export interface UsageStats {
   turns: number;
 }
 
+export type BackendName = "pi" | "codex" | "claude";
+
 export interface TaskSpec {
+  /** Agent CLI powering this child. Defaults to "pi". */
+  backend?: BackendName;
   task: string;
   /** Short human label shown in UIs and result indexes. */
   label?: string;
@@ -86,6 +90,8 @@ export interface TaskResult {
   model?: string;
   thinking?: TaskSpec["thinking"];
   profile?: TaskProfile;
+  /** Backend that produced this result (pi | codex | claude). */
+  backend?: BackendName;
   canWrite?: boolean;
   stopReason?: string;
   /** Present when stopReason is a timeout-like outcome. */
@@ -154,6 +160,7 @@ export interface RunSnapshot {
     profile?: TaskProfile;
     canWrite?: boolean;
     outputFile?: string;
+    backend?: BackendName;
     outputMode?: OutputMode;
     worktree?: { cwd: string; branch: string; baseCommit: string; changed: boolean; diffSummary?: string };
     sessionId?: string;

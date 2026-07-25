@@ -1,5 +1,87 @@
 # Changelog
 
+## 0.6.0
+
+### Multi-backend children: pi, Codex, Claude Code
+
+`backend: "pi" | "codex" | "claude"` on any task, parallel item, or agent
+frontmatter. Children run on the vendor CLI as a child process, so **every
+existing safety guarantee still applies** — git worktree isolation, machine-wide
+process locks, nesting-depth limits, orphan reclaim, PID-identity group kill —
+and **no new dependencies** are added. (The reference implementation this was
+adapted from embeds `@anthropic-ai/claude-agent-sdk` in-process; the `claude`
+CLI exposes everything needed without that weight.)
+
+Internally this is a new `BackendAdapter` seam (`src/backend.ts`,
+`src/backends/`). `ChildRunner` keeps all the backend-agnostic machinery;
+adapters own only invocation building, event-stream parsing, the stdin command
+dialect, and a capability record. The `pi` backend is a verbatim extraction of
+the previous inline logic.
+
+**Capabilities are enforced, not assumed.** Requests a backend cannot honor are
+refused at validation time with an explanation, because silently dropping a
+budget or a read-only guarantee turns a safety feature into a no-op:
+
+| | pi | codex | claude |
+|---|---|---|---|
+| `max_cost` | ✅ | ❌ refused (tokens only, no cost) | ✅ `total_cost_usd` |
+| read-only profile | ✅ tool allowlist | ✅ `--sandbox read-only` (OS-level) | ✅ `--allowedTools` |
+| steering / graceful wrap-up | ✅ | ❌ no stdin channel | ❌ one-shot print mode |
+| `resume` | ✅ | ✅ | ✅ |
+| `context:'fork'` / `fork_resume` | ✅ | ❌ refused | ✅ `--fork-session` |
+| `thinking` | ✅ | ❌ | ❌ |
+| `output_schema` | ✅ | ✅ `--output-schema` | ✅ `--json-schema` |
+
+Parsers were written against event streams captured verbatim from the real
+CLIs (codex-cli 0.144.6, claude-code 2.1.219) and are fixture-tested including
+truncated-stream, API-error and rate-limit paths.
+
+### Live transcript for every backend
+
+Pressing `t` on a running run in `/subagents` previously assumed pi's session
+layout and entry schema, so codex/claude runs showed "waiting for child
+session…" forever. Vendor transcripts are now located by session id and
+rendered through per-backend renderers, with each vendor's boilerplate
+(codex's sandbox preamble, claude's queue bookkeeping) filtered out.
+
+Tests: 277 → 308.
+
+**Verified live:** codex end-to-end through the runner; the `max_cost` refusal
+message; codex's read-only sandbox blocking a shell write with "operation not
+permitted"; and both vendor transcripts tailing real on-disk session files.
+Claude's happy path is fixture-tested only — the development account was
+rate-limited during this work.
+
+## 0.5.1
+
+### `subagent_wait` — dedicated blocking-collect tool
+
+- New **`subagent_wait`** tool (`{ id, timeout_ms? }`) sits alongside `subagent`.
+  Collecting a background run is the one management step a model reaches for
+  reflexively mid-flow, and burying it behind the `action:` union cost a
+  discovery step. This matches the shape the highest-adoption package in the
+  ecosystem converged on (`pi-subagents` ships `subagent` + `subagent_wait`).
+- Implemented as a thin front-end that rewrites its arguments into the
+  equivalent `action:"wait"` request and reuses the main tool's `execute`, so
+  delivery / `markDelivered` / output-cap semantics cannot drift between the
+  two surfaces. `action:"wait"` remains fully supported.
+- **`timeout_ms`** added to the shared wait path (so `action:"wait"` gains it
+  too): on timeout the run is explicitly **not** cancelled and **not** marked
+  delivered, so it stays collectable by a later wait.
+
+### `/btw` — side questions hidden from the main agent
+
+- New **`/btw <question>`** command (or bare `/btw` for a prompt). The aside
+  runs as a normal subagent run — full policy, profile, budget, semaphore and
+  process-lock machinery — but its result is delivered with `pi.appendEntry()`
+  + an entry renderer, which by design does not participate in LLM context.
+  The user gets an answer rendered in the transcript while the main agent keeps
+  working, unaware of both question and answer.
+- Ported from [davis7dotsh/my-pi-setup](https://github.com/davis7dotsh/my-pi-setup)'s
+  by-the-way feature, adapted to our process-per-child model.
+
+Tests: 273 → 276. Both features' load-bearing invariants are mutation-checked.
+
 ## 0.5.0
 
 ### Native Pi cost accounting (pi#6671)

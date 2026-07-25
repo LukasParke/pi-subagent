@@ -12,6 +12,7 @@ const ThinkingLevel = Type.Union([
 const OutputMode = Type.Union([Type.Literal("inline"), Type.Literal("file-only")]);
 const Profile = Type.Union([Type.Literal("explore"), Type.Literal("review"), Type.Literal("general")]);
 const Isolation = Type.Union([Type.Literal("shared"), Type.Literal("worktree")]);
+const Backend = Type.Union([Type.Literal("pi"), Type.Literal("codex"), Type.Literal("claude")]);
 const Action = Type.Union([
   Type.Literal("status"),
   Type.Literal("wait"),
@@ -25,6 +26,7 @@ const Action = Type.Union([
 
 /** Shared optional task configuration fields. */
 export const TaskFields = {
+  backend: Type.Optional({ ...Backend, description: "Agent CLI powering the child. pi (default) supports every feature. codex uses codex exec with an OS-level read-only sandbox, but reports no cost (max_cost is refused) and cannot be steered. claude uses the claude CLI, reports cost, and cannot be steered. Unsupported combinations are refused with an explanation rather than silently ignored." }),
   agent: Type.Optional(Type.String({ minLength: 1, description: "Named agent to use (from .pi/agents/<name>.md). Supplies persona system prompt and defaults; explicit params still override." })),
   description: Type.Optional(Type.String({ description: "Short human label (3-5 words) shown in UIs and result indexes." })),
   system_prompt: Type.Optional(Type.String({ description: "Extra system prompt appended to the child's prompt (does not replace it)." })),
@@ -125,6 +127,35 @@ export const SubagentParamsSchema = Type.Object(
 
 export type SubagentParams = Static<typeof SubagentParamsSchema>;
 export type ParallelTaskInput = Static<typeof ParallelTaskItem>;
+
+/**
+ * Dedicated blocking-wait tool.
+ *
+ * `subagent` already exposes wait via `action: "wait"`, but collecting a
+ * background run is the one management step a model reaches for reflexively
+ * mid-flow, and burying it behind an action union costs a discovery step.
+ * This mirrors the highest-adoption package in the ecosystem (`pi-subagents`
+ * ships `subagent` + `subagent_wait` for the same reason). It is a thin
+ * front-end over the identical handler — no second delivery path.
+ */
+export const SubagentWaitParamsSchema = Type.Object(
+  {
+    id: Type.String({ minLength: 1, description: "Run id (or unique prefix) of the background run to collect." }),
+    timeout_ms: Type.Optional(
+      Type.Number({
+        minimum: 1,
+        maximum: 24 * 60 * 60_000,
+        description: "Give up waiting after this long and return a still-running notice. The run is NOT cancelled; collect it later with subagent_wait or action:'status'. Omit to wait until the run settles.",
+      }),
+    ),
+  },
+  {
+    additionalProperties: false,
+    description: "Block until a background subagent run settles, then deliver its output.",
+  },
+);
+
+export type SubagentWaitParams = Static<typeof SubagentWaitParamsSchema>;
 
 /** Runtime guard used by tests/docs to assert provider compatibility. */
 export function assertObjectToolSchema(schema: unknown): asserts schema is { type: "object" } {

@@ -88,6 +88,7 @@ export function toPersistedResult(result: TaskResult): PersistedResult {
     model: result.model,
     thinking: result.thinking,
     profile: result.profile,
+    backend: result.backend,
     canWrite: result.canWrite,
     outputFile: result.outputFile,
     outputMode: result.outputMode,
@@ -158,6 +159,7 @@ export function toCheckpointResult(result: TaskResult): PersistedResult {
     model: result.model,
     thinking: result.thinking,
     profile: result.profile,
+    backend: result.backend,
     canWrite: result.canWrite,
     outputFile: result.outputFile,
     outputMode: result.outputMode,
@@ -340,6 +342,7 @@ export class SessionScopedRunRegistry {
       outputMode: spec.outputMode,
       thinking: spec.thinking,
       profile: spec.profile,
+      backend: spec.backend,
       canWrite: spec.canWrite,
       protocol: {
         headerSeen: false,

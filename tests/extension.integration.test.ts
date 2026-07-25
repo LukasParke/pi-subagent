@@ -7,6 +7,8 @@ import { RUN_ENTRY_TYPE } from "../src/persistence.js";
 
 interface Harness {
   tool: any;
+  waitTool: any;
+  commands: Map<string, any>;
   handlers: Map<string, Function>;
   entries: any[];
   ctx: any;
@@ -28,6 +30,8 @@ function harness(): Harness {
   const handlers = new Map<string, Function>();
   const entries: any[] = [rootAssistant(0.2)];
   let tool: any;
+  let waitTool: any;
+  const commands = new Map<string, any>();
   const ui = {
     theme: { fg: (_c: string, text: string) => text, bold: (text: string) => text },
     setStatus: vi.fn(), notify: vi.fn(), setEditorText: vi.fn(),
@@ -44,9 +48,15 @@ function harness(): Harness {
   const sentMessages: any[] = [];
   const pi = {
     on: (name: string, fn: Function) => handlers.set(name, fn),
-    registerTool: (definition: any) => { tool = definition; },
-    registerCommand: vi.fn(),
+    // Two tools register (`subagent` + `subagent_wait`); keep the main one as
+    // `tool` and expose the wait front-end separately.
+    registerTool: (definition: any) => {
+      if (definition.name === "subagent_wait") waitTool = definition;
+      else tool = definition;
+    },
+    registerCommand: (name: string, options: any) => { commands.set(name, options); },
     registerMessageRenderer: vi.fn(),
+    registerEntryRenderer: vi.fn(),
     sendMessage: (message: any, options?: any) => { sentMessages.push({ message, options }); },
     appendEntry: (customType: string, data: unknown) => entries.push({
       type: "custom", customType, data, id: `e-${entries.length}`, parentId: null, timestamp: new Date().toISOString(),
@@ -56,7 +66,7 @@ function harness(): Harness {
     getThinkingLevel: () => "off",
   };
   register(pi as any);
-  return { get tool() { return tool; }, handlers, entries, ctx, pi, sentMessages } as unknown as Harness;
+  return { get tool() { return tool; }, get waitTool() { return waitTool; }, commands, handlers, entries, ctx, pi, sentMessages } as unknown as Harness;
 }
 
 async function execute(h: Harness, params: any, signal?: AbortSignal, update = vi.fn()) {
@@ -575,6 +585,77 @@ describe("extension end-to-end wiring", () => {
     const specific = await execute(h, { action: "status", id });
     expect(specific.content[0].text).toContain("session test-session-123");
     expect(specific.content[0].text).not.toMatch(/\(resumable\)/);
+    await h.handlers.get("session_shutdown")!();
+  });
+
+  it("subagent_wait delivers a background run like action:wait", async () => {
+    const h = harness();
+    await h.handlers.get("session_start")!({}, h.ctx);
+    expect(h.waitTool.name).toBe("subagent_wait");
+
+    const started = await execute(h, { task: "bg", profile: "explore", async: true });
+    const id = runId(started.content[0].text);
+
+    const delivered = await h.waitTool.execute("call", { id }, undefined, vi.fn(), h.ctx);
+    expect(delivered.isError).not.toBe(true);
+    expect(delivered.content[0].text).toBe("Hello world!");
+
+    // Delivery is consumed exactly once, shared with action:wait.
+    const again = await execute(h, { action: "wait", id });
+    expect(again.content[0].text).toMatch(/already delivered/);
+    await h.handlers.get("session_shutdown")!();
+  });
+
+  it("subagent_wait timeout leaves the run alive and collectable", async () => {
+    const h = harness();
+    await h.handlers.get("session_start")!({}, h.ctx);
+    process.env.FAKE_PI_DELAY_MS = "300";
+    const started = await execute(h, { task: "slow", profile: "explore", async: true });
+    const id = runId(started.content[0].text);
+
+    const timedOut = await h.waitTool.execute("call", { id, timeout_ms: 20 }, undefined, vi.fn(), h.ctx);
+    expect(timedOut.isError).not.toBe(true);
+    expect(timedOut.content[0].text).toMatch(/timed out after 20ms/);
+    expect(timedOut.content[0].text).toMatch(/NOT cancelled/);
+
+    // Timing out must not consume the result: it still delivers afterwards.
+    const delivered = await h.waitTool.execute("call", { id }, undefined, vi.fn(), h.ctx);
+    expect(delivered.content[0].text).toBe("Hello world!");
+    await h.handlers.get("session_shutdown")!();
+  });
+
+  it("/btw answers via a model-hidden custom entry, not an LLM message", async () => {
+    const h = harness();
+    await h.handlers.get("session_start")!({}, h.ctx);
+
+    const btw = h.commands.get("btw");
+    expect(btw).toBeTruthy();
+
+    const before = h.sentMessages.length;
+    await btw.handler("what does this repo do?", h.ctx);
+
+    // The answer lands as a custom entry (appendEntry => excluded from LLM context).
+    const btwEntries = h.entries.filter((entry) => entry.customType === "subagent-btw");
+    expect(btwEntries.length).toBe(2); // running, then done
+    expect(btwEntries[0].data.state).toBe("running");
+    expect(btwEntries[1].data.state).toBe("done");
+    expect(btwEntries[1].data.answer).toBe("Hello world!");
+    expect(btwEntries[1].data.label).toBe("what does this repo do?");
+
+    // Critically: nothing was pushed into the model's context.
+    expect(h.sentMessages.length).toBe(before);
+    await h.handlers.get("session_shutdown")!();
+  });
+
+  it("/btw without a question requires dialog-capable UI", async () => {
+    const h = harness();
+    await h.handlers.get("session_start")!({}, h.ctx);
+    const btw = h.commands.get("btw");
+
+    // harness ctx has hasUI: false (print-mode equivalent)
+    await btw.handler("", h.ctx);
+    expect(h.ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("/btw needs a question"), "error");
+    expect(h.entries.some((entry) => entry.customType === "subagent-btw")).toBe(false);
     await h.handlers.get("session_shutdown")!();
   });
 
